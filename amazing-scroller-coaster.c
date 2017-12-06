@@ -64,39 +64,12 @@
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-#ifndef DRM_FORMAT_MOD_LINEAR
-#define DRM_FORMAT_MOD_LINEAR 0
-#endif
-
-#ifndef DRM_FORMAT_MOD_INVALID
-#define DRM_FORMAT_MOD_INVALID ((((__u64)0) << 56) | ((1ULL << 56) - 1))
-#endif
-
-#ifndef EGL_KHR_platform_gbm
-#define EGL_KHR_platform_gbm 1
-#define EGL_PLATFORM_GBM_KHR              0x31D7
-#endif /* EGL_KHR_platform_gbm */
-
-#ifndef EGL_EXT_platform_base
-#define EGL_EXT_platform_base 1
-typedef EGLDisplay (EGLAPIENTRYP PFNEGLGETPLATFORMDISPLAYEXTPROC) (EGLenum platform, void *native_display, const EGLint *attrib_list);
-typedef EGLSurface (EGLAPIENTRYP PFNEGLCREATEPLATFORMWINDOWSURFACEEXTPROC) (EGLDisplay dpy, EGLConfig config, void *native_window, const EGLint *attrib_list);
-typedef EGLSurface (EGLAPIENTRYP PFNEGLCREATEPLATFORMPIXMAPSURFACEEXTPROC) (EGLDisplay dpy, EGLConfig config, void *native_pixmap, const EGLint *attrib_list);
-#ifdef EGL_EGLEXT_PROTOTYPES
-EGLAPI EGLDisplay EGLAPIENTRY eglGetPlatformDisplayEXT (EGLenum platform, void *native_display, const EGLint *attrib_list);
-EGLAPI EGLSurface EGLAPIENTRY eglCreatePlatformWindowSurfaceEXT (EGLDisplay dpy, EGLConfig config, void *native_window, const EGLint *attrib_list);
-EGLAPI EGLSurface EGLAPIENTRY eglCreatePlatformPixmapSurfaceEXT (EGLDisplay dpy, EGLConfig config, void *native_pixmap, const EGLint *attrib_list);
-#endif
-#endif /* EGL_EXT_platform_base */
-
 struct gbm {
 	struct gbm_device *dev;
 	struct gbm_surface *surface;
 	int width, height;
+	struct gbm_bo *last_bo;
 };
-
-const struct gbm * init_gbm(int drm_fd, int w, int h, uint64_t modifier);
-
 
 struct egl {
 	EGLDisplay display;
@@ -113,18 +86,7 @@ struct egl {
 	PFNEGLWAITSYNCKHRPROC eglWaitSyncKHR;
 	PFNEGLCLIENTWAITSYNCKHRPROC eglClientWaitSyncKHR;
 	PFNEGLDUPNATIVEFENCEFDANDROIDPROC eglDupNativeFenceFDANDROID;
-
-	void (*draw)(unsigned i);
 };
-
-int init_egl(struct egl *egl, const struct gbm *gbm);
-int create_program(const char *vs_src, const char *fs_src);
-int link_program(unsigned program);
-
-const struct egl * init_cube_tex(const struct gbm *gbm);
-
-struct gbm;
-struct egl;
 
 struct props {
 	const char *name;
@@ -149,18 +111,12 @@ struct drm {
 	int kms_out_fence_fd;
 
 	drmModeModeInfo *mode;
-
-	int (*run)(const struct gbm *gbm, const struct egl *egl);
 };
 
 struct drm_fb {
 	struct gbm_bo *bo;
 	uint32_t fb_id;
 };
-
-struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo);
-
-struct drm *init_drm(const char *device);
 
 struct scratch_bo {
 	uint32_t gem_handle;
@@ -181,7 +137,8 @@ drm_fb_destroy_callback(struct gbm_bo *bo, void *data)
 	free(fb);
 }
 
-struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
+static struct drm_fb *
+drm_fb_get_from_bo(struct gbm_bo *bo)
 {
 	int drm_fd = gbm_device_get_fd(gbm_bo_get_device(bo));
 	struct drm_fb *fb = gbm_bo_get_user_data(bo);
@@ -201,7 +158,7 @@ struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
 	uint32_t offsets[4] = { 0, };
 	uint64_t modifiers[4] = { I915_FORMAT_MOD_Y_TILED, };
 
-#if 1
+#if 0
 	struct scratch_bo *sbo = create_scratch_bo();
 	handles[0] = sbo->gem_handle;
 	strides[0] = sbo->stride;
@@ -222,27 +179,9 @@ struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
 	return fb;
 }
 
-static uint32_t find_crtc_for_encoder(const drmModeRes *resources,
-		const drmModeEncoder *encoder) {
-	int i;
-
-	for (i = 0; i < resources->count_crtcs; i++) {
-		/* possible_crtcs is a bitmask as described here:
-		 * https://dvdhrm.wordpress.com/2012/09/13/linux-drm-mode-setting-api
-		 */
-		const uint32_t crtc_mask = 1 << i;
-		const uint32_t crtc_id = resources->crtcs[i];
-		if (encoder->possible_crtcs & crtc_mask) {
-			return crtc_id;
-		}
-	}
-
-	/* no match found */
-	return -1;
-}
-
-static uint32_t find_crtc_for_connector(const struct drm *drm, const drmModeRes *resources,
-		const drmModeConnector *connector) {
+static uint32_t
+find_crtc_for_connector(const struct drm *drm, const drmModeRes *resources,
+			const drmModeConnector *connector) {
 	int i;
 
 	for (i = 0; i < connector->count_encoders; i++) {
@@ -250,12 +189,9 @@ static uint32_t find_crtc_for_connector(const struct drm *drm, const drmModeRes 
 		drmModeEncoder *encoder = drmModeGetEncoder(drm->fd, encoder_id);
 
 		if (encoder) {
-			const uint32_t crtc_id = find_crtc_for_encoder(resources, encoder);
+			int i = __builtin_ffs(encoder->possible_crtcs) - 1;
 
-			drmModeFreeEncoder(encoder);
-			if (crtc_id != 0) {
-				return crtc_id;
-			}
+			return resources->crtcs[i];
 		}
 	}
 
@@ -378,106 +314,6 @@ static EGLSyncKHR create_fence(const struct egl *egl, int fd)
 	return fence;
 }
 
-static int atomic_run(const struct gbm *gbm, const struct egl *egl)
-{
-	struct pollfd pfd[1] = { { .fd = 0, .events = POLLIN } };
-	struct gbm_bo *bo = NULL;
-	struct drm_fb *fb;
-	uint32_t i = 0;
-	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
-	int ret;
-
-	/* Allow a modeset change for the first commit only. */
-	flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
-
-	while (poll(pfd, 1, 0) == 0) {
-		struct gbm_bo *next_bo;
-		EGLSyncKHR gpu_fence = NULL;   /* out-fence from gpu, in-fence to kms */
-		EGLSyncKHR kms_fence = NULL;   /* in-fence to gpu, out-fence from kms */
-
-		if (drm.kms_out_fence_fd != -1) {
-			kms_fence = create_fence(egl, drm.kms_out_fence_fd);
-			assert(kms_fence);
-
-			/* driver now has ownership of the fence fd: */
-			drm.kms_out_fence_fd = -1;
-
-			/* wait "on the gpu" (ie. this won't necessarily block, but
-			 * will block the rendering until fence is signaled), until
-			 * the previous pageflip completes so we don't render into
-			 * the buffer that is still on screen.
-			 */
-			egl->eglWaitSyncKHR(egl->display, kms_fence, 0);
-		}
-
-		egl->draw(i++);
-
-		/* insert fence to be singled in cmdstream.. this fence will be
-		 * signaled when gpu rendering done
-		 */
-		gpu_fence = create_fence(egl, EGL_NO_NATIVE_FENCE_FD_ANDROID);
-		assert(gpu_fence);
-
-		eglSwapBuffers(egl->display, egl->surface);
-
-		/* after swapbuffers, gpu_fence should be flushed, so safe
-		 * to get fd:
-		 */
-		drm.kms_in_fence_fd = egl->eglDupNativeFenceFDANDROID(egl->display, gpu_fence);
-		egl->eglDestroySyncKHR(egl->display, gpu_fence);
-		assert(drm.kms_in_fence_fd != -1);
-
-		next_bo = gbm_surface_lock_front_buffer(gbm->surface);
-		if (!next_bo) {
-			printf("Failed to lock frontbuffer\n");
-			return -1;
-		}
-		fb = drm_fb_get_from_bo(next_bo);
-		if (!fb) {
-			printf("Failed to get a new framebuffer BO\n");
-			return -1;
-		}
-
-		if (kms_fence) {
-			EGLint status;
-
-			/* Wait on the CPU side for the _previous_ commit to
-			 * complete before we post the flip through KMS, as
-			 * atomic will reject the commit if we post a new one
-			 * whilst the previous one is still pending.
-			 */
-			do {
-				status = egl->eglClientWaitSyncKHR(egl->display,
-								   kms_fence,
-								   0,
-								   EGL_FOREVER_KHR);
-			} while (status != EGL_CONDITION_SATISFIED_KHR);
-
-			egl->eglDestroySyncKHR(egl->display, kms_fence);
-		}
-
-		/*
-		 * Here you could also update drm plane layers if you want
-		 * hw composition
-		 */
-		ret = drm_atomic_commit(fb, flags);
-		if (ret) {
-			printf("failed to commit: %s\n", strerror(errno));
-			return -1;
-		}
-
-		/* release last buffer to render on again: */
-		if (bo)
-			gbm_surface_release_buffer(gbm->surface, bo);
-		bo = next_bo;
-
-		/* Allow a modeset change for the first commit only. */
-		flags &= ~(DRM_MODE_ATOMIC_ALLOW_MODESET);
-	}
-
-	return ret;
-}
-
 /* Pick a plane.. something that at a minimum can be connected to
  * the chosen crtc, but prefer primary plane.
  *
@@ -562,7 +398,8 @@ get_properties(struct props *props,
 	return 0;
 }
 
-struct drm *init_drm(const char *device)
+static struct drm *
+init_drm(const char *device)
 {
 	drmModeRes *resources;
 	drmModeEncoder *encoder = NULL;
@@ -673,8 +510,6 @@ struct drm *init_drm(const char *device)
 	get_properties(&drm.connector_props, "connector",
 		       DRM_MODE_OBJECT_CONNECTOR, drm.connector->connector_id);
 
-	drm.run = atomic_run;
-
 	return &drm;
 }
 
@@ -766,7 +601,8 @@ const struct egl *egl = &gl.egl;
 
 static struct gbm gbm;
 
-const struct gbm * init_gbm(int drm_fd, int w, int h, uint64_t modifier)
+static struct gbm *
+init_gbm(int drm_fd, int w, int h, uint64_t modifier)
 {
 	gbm.dev = gbm_create_device(drm_fd);
 	uint64_t modifiers[] = { I915_FORMAT_MOD_Y_TILED };
@@ -815,7 +651,8 @@ static inline int __egl_check(void *ptr, const char *name)
 
 #define egl_check(egl, name) __egl_check((egl)->name, #name)
 
-int init_egl(struct egl *egl, const struct gbm *gbm)
+static int
+init_egl(struct egl *egl, const struct gbm *gbm)
 {
 	EGLint major, minor, n;
 
@@ -935,7 +772,8 @@ int init_egl(struct egl *egl, const struct gbm *gbm)
 	return 0;
 }
 
-int create_program(const char *vs_src, const char *fs_src)
+static int
+create_program(const char *vs_src, const char *fs_src)
 {
 	GLuint vertex_shader, fragment_shader, program;
 	GLint ret;
@@ -989,7 +827,8 @@ int create_program(const char *vs_src, const char *fs_src)
 	return program;
 }
 
-int link_program(unsigned program)
+static int
+link_program(unsigned program)
 {
 	GLint ret;
 
@@ -1222,16 +1061,11 @@ create_tile(uint32_t width, uint32_t height)
 	return tile;
 }
 
-static void draw_cube_tex(unsigned i)
+static void draw_cube_tex(uint32_t offset_x, uint32_t offset_y)
 {
-	(void) i;
-
 	glClearColor(0.5, 0.5, 0.5, 1.0);
 	glClear(GL_COLOR_BUFFER_BIT);
 	glUniform1i(gl.texture, 0);
-
-	const uint32_t offset_x = cos((i & 255) / 256.0f * 2 * M_PI) * 150 + 200;
-	const uint32_t offset_y = sin((i & 255) / 256.0f * 2 * M_PI) * 150 + 200;
 
 	uint32_t tile_x = offset_x / tile_width;
 	uint32_t tile_offset_x = offset_x & (tile_width - 1);
@@ -1269,6 +1103,145 @@ static void draw_cube_tex(unsigned i)
 	}
 }
 
+static struct egl *
+init_cube_tex(const struct gbm *gbm)
+{
+	int ret;
+
+	ret = init_egl(&gl.egl, gbm);
+	if (ret)
+		return NULL;
+
+	gl.gbm = gbm;
+
+	ret = create_program(vertex_shader_source, fragment_shader_source);
+	if (ret < 0)
+		return NULL;
+
+	gl.program = ret;
+
+	glBindAttribLocation(gl.program, 0, "in_position");
+	glBindAttribLocation(gl.program, 1, "in_TexCoord");
+
+	ret = link_program(gl.program);
+	if (ret)
+		return NULL;
+
+	glUseProgram(gl.program);
+
+	gl.texture = glGetUniformLocation(gl.program, "uTex");
+
+	glViewport(0, 0, gbm->width, gbm->height);
+
+	for (uint32_t i = 0; i < ARRAY_SIZE(gl.tiles); i++) {
+		gl.tiles[i] = create_tile(tile_width, tile_height);
+		if (gl.tiles[i] == NULL) {
+			printf("failed to initialize EGLImage texture\n");
+			return NULL;
+		}
+	}
+
+	glGenBuffers(1, &gl.vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
+	glBufferData(GL_ARRAY_BUFFER, 4096, 0, GL_STATIC_DRAW);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const GLvoid *)(intptr_t)0);
+	glEnableVertexAttribArray(0);
+
+	return &gl.egl;
+}
+
+static int atomic_run(struct gbm *gbm, const struct egl *egl,
+		      uint32_t offset_x, uint32_t offset_y)
+{
+	struct drm_fb *fb;
+	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
+	int ret;
+
+	/* Allow a modeset change for the first commit only. */
+	flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
+
+	struct gbm_bo *next_bo;
+	EGLSyncKHR gpu_fence = NULL;   /* out-fence from gpu, in-fence to kms */
+	EGLSyncKHR kms_fence = NULL;   /* in-fence to gpu, out-fence from kms */
+
+	if (drm.kms_out_fence_fd != -1) {
+		kms_fence = create_fence(egl, drm.kms_out_fence_fd);
+		assert(kms_fence);
+
+		/* driver now has ownership of the fence fd: */
+		drm.kms_out_fence_fd = -1;
+
+		/* wait "on the gpu" (ie. this won't necessarily block, but
+		 * will block the rendering until fence is signaled), until
+		 * the previous pageflip completes so we don't render into
+		 * the buffer that is still on screen.
+		 */
+		egl->eglWaitSyncKHR(egl->display, kms_fence, 0);
+	}
+
+	draw_cube_tex(offset_x, offset_y);
+
+	/* insert fence to be singled in cmdstream.. this fence will be
+	 * signaled when gpu rendering done
+	 */
+	gpu_fence = create_fence(egl, EGL_NO_NATIVE_FENCE_FD_ANDROID);
+	assert(gpu_fence);
+
+	eglSwapBuffers(egl->display, egl->surface);
+
+	/* after swapbuffers, gpu_fence should be flushed, so safe
+	 * to get fd:
+	 */
+	drm.kms_in_fence_fd = egl->eglDupNativeFenceFDANDROID(egl->display, gpu_fence);
+	egl->eglDestroySyncKHR(egl->display, gpu_fence);
+	assert(drm.kms_in_fence_fd != -1);
+
+	next_bo = gbm_surface_lock_front_buffer(gbm->surface);
+	if (!next_bo) {
+		printf("Failed to lock frontbuffer\n");
+		return -1;
+	}
+	fb = drm_fb_get_from_bo(next_bo);
+	if (!fb) {
+		printf("Failed to get a new framebuffer BO\n");
+		return -1;
+	}
+
+	if (kms_fence) {
+		EGLint status;
+
+		/* Wait on the CPU side for the _previous_ commit to
+		 * complete before we post the flip through KMS, as
+		 * atomic will reject the commit if we post a new one
+		 * whilst the previous one is still pending.
+		 */
+		do {
+			status = egl->eglClientWaitSyncKHR(egl->display,
+							   kms_fence,
+							   0,
+							   EGL_FOREVER_KHR);
+		} while (status != EGL_CONDITION_SATISFIED_KHR);
+
+		egl->eglDestroySyncKHR(egl->display, kms_fence);
+	}
+
+	/*
+	 * Here you could also update drm plane layers if you want
+	 * hw composition
+	 */
+	ret = drm_atomic_commit(fb, flags);
+	if (ret) {
+		printf("failed to commit: %s\n", strerror(errno));
+		return -1;
+	}
+
+	/* release last buffer to render on again: */
+	if (gbm->last_bo)
+		gbm_surface_release_buffer(gbm->surface, gbm->last_bo);
+	gbm->last_bo = next_bo;
+
+	return 0;
+}
 
 struct scratch_bo *
 create_scratch_bo(void)
@@ -1326,55 +1299,6 @@ create_scratch_bo(void)
 	return sbo;
 }
 
-const struct egl *
-init_cube_tex(const struct gbm *gbm)
-{
-	int ret;
-
-	ret = init_egl(&gl.egl, gbm);
-	if (ret)
-		return NULL;
-
-	gl.gbm = gbm;
-
-	ret = create_program(vertex_shader_source, fragment_shader_source);
-	if (ret < 0)
-		return NULL;
-
-	gl.program = ret;
-
-	glBindAttribLocation(gl.program, 0, "in_position");
-	glBindAttribLocation(gl.program, 1, "in_TexCoord");
-
-	ret = link_program(gl.program);
-	if (ret)
-		return NULL;
-
-	glUseProgram(gl.program);
-
-	gl.texture = glGetUniformLocation(gl.program, "uTex");
-
-	glViewport(0, 0, gbm->width, gbm->height);
-
-	for (uint32_t i = 0; i < ARRAY_SIZE(gl.tiles); i++) {
-		gl.tiles[i] = create_tile(tile_width, tile_height);
-		if (gl.tiles[i] == NULL) {
-			printf("failed to initialize EGLImage texture\n");
-			return NULL;
-		}
-	}
-
-	glGenBuffers(1, &gl.vbo);
-	glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
-	glBufferData(GL_ARRAY_BUFFER, 4096, 0, GL_STATIC_DRAW);
-	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const GLvoid *)(intptr_t)0);
-	glEnableVertexAttribArray(0);
-
-	gl.egl.draw = draw_cube_tex;
-
-	return &gl.egl;
-}
-
 static const char *shortopts = "D:m:";
 
 static const struct option longopts[] = {
@@ -1399,9 +1323,9 @@ int main(int argc, char *argv[])
 	uint64_t modifier = DRM_FORMAT_MOD_INVALID;
 	int opt;
 
-	const struct egl *egl;
-	const struct gbm *gbm;
-	const struct drm *drm;
+	struct egl *egl;
+	struct gbm *gbm;
+	struct drm *drm;
 
 	while ((opt = getopt_long_only(argc, argv, shortopts, longopts, NULL)) != -1) {
 		switch (opt) {
@@ -1439,5 +1363,16 @@ int main(int argc, char *argv[])
 	if (init_vt())
 		return -1;
 
-	return drm->run(gbm, egl);
+	uint32_t i;
+	struct pollfd pfd[1] = { { .fd = 0, .events = POLLIN } };
+	int ret = 0;
+	while (poll(pfd, 1, 0) == 0 && ret == 0) {
+		const uint32_t offset_x = cos((i & 255) / 256.0f * 2 * M_PI) * 150 + 200;
+		const uint32_t offset_y = sin((i & 255) / 256.0f * 2 * M_PI) * 150 + 200;
+		i++;
+
+		ret = atomic_run(gbm, egl, offset_x, offset_y);
+	}
+
+	return 0;
 }
