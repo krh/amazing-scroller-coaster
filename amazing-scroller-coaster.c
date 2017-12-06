@@ -598,23 +598,31 @@ struct {
 const struct egl *egl = &gl.egl;
 
 static struct gpu_scroller *
-create_gpu_scroller(int drm_fd, int w, int h, uint64_t modifier)
+create_gpu_scroller(const char *device)
 {
 	struct gpu_scroller *scroller = malloc(sizeof(*scroller));
+	struct drm *drm;
 
-	scroller->dev = gbm_create_device(drm_fd);
+	drm = init_drm(device);
+	if (!drm) {
+		printf("failed to initialize atomic DRM\n");
+		return NULL;
+	}
+
+	scroller->dev = gbm_create_device(drm->fd);
+	scroller->width = drm->mode->hdisplay - 200;
+	scroller->height = drm->mode->vdisplay - 200;
 
 	static const uint64_t modifiers[] = { I915_FORMAT_MOD_Y_TILED };
-	scroller->surface = gbm_surface_create_with_modifiers(scroller->dev, w, h,
+	scroller->surface = gbm_surface_create_with_modifiers(scroller->dev,
+							      scroller->width,
+							      scroller->height,
 							      GBM_FORMAT_XRGB8888,
 							      modifiers, ARRAY_SIZE(modifiers));
 	if (!scroller->surface) {
 		printf("failed to create gbm surface\n");
 		return NULL;
 	}
-
-	scroller->width = w;
-	scroller->height = h;
 
 	return scroller;
 }
@@ -1298,41 +1306,33 @@ create_scratch_bo(int fd)
 	return sbo;
 }
 
-static const char *shortopts = "D:m:";
+static const char *shortopts = "D:";
 
 static const struct option longopts[] = {
 	{"device", required_argument, 0, 'D'},
-	{"modifier", required_argument, 0, 'm'},
 	{0, 0, 0, 0}
 };
 
 static void usage(const char *name)
 {
-	printf("Usage: %s [-Dm]\n"
-			"\n"
-			"options:\n"
-			"    -D, --device=DEVICE      use the given device\n"
-			"    -m, --modifier=MODIFIER  hardcode the selected modifier\n",
-			name);
+	printf("Usage: %s [-D]\n"
+	       "\n"
+	       "options:\n"
+	       "    -D, --device=DEVICE      use the given device\n",
+	       name);
 }
 
 int main(int argc, char *argv[])
 {
 	const char *device = "/dev/dri/card0";
-	uint64_t modifier = DRM_FORMAT_MOD_INVALID;
 	int opt;
-
 	struct egl *egl;
 	struct gpu_scroller *scroller;
-	struct drm *drm;
 
 	while ((opt = getopt_long_only(argc, argv, shortopts, longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'D':
 			device = optarg;
-			break;
-		case 'm':
-			modifier = strtoull(optarg, NULL, 0);
 			break;
 		default:
 			usage(argv[0]);
@@ -1340,14 +1340,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	drm = init_drm(device);
-	if (!drm) {
-		printf("failed to initialize atomic DRM\n");
-		return -1;
-	}
-
-	scroller = create_gpu_scroller(drm->fd, drm->mode->hdisplay - 200, drm->mode->vdisplay - 200,
-				       modifier);
+	scroller = create_gpu_scroller(device);
 	if (!scroller) {
 		printf("failed to initialize GBM\n");
 		return -1;
