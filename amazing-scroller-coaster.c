@@ -64,13 +64,6 @@
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-struct gpu_scroller {
-	struct gbm_device *dev;
-	struct gbm_surface *surface;
-	int width, height;
-	struct gbm_bo *last_bo;
-};
-
 struct egl {
 	EGLDisplay display;
 	EGLConfig config;
@@ -86,6 +79,22 @@ struct egl {
 	PFNEGLWAITSYNCKHRPROC eglWaitSyncKHR;
 	PFNEGLCLIENTWAITSYNCKHRPROC eglClientWaitSyncKHR;
 	PFNEGLDUPNATIVEFENCEFDANDROIDPROC eglDupNativeFenceFDANDROID;
+};
+
+struct gpu_scroller {
+	struct gbm_device *dev;
+	struct gbm_surface *surface;
+	int width, height;
+	struct gbm_bo *last_bo;
+
+	struct egl egl;
+
+	GLuint program;
+	/* uniform handles: */
+	GLint texture;
+	GLuint vbo;
+
+	struct tile *tiles[64];
 };
 
 struct props {
@@ -123,7 +132,242 @@ struct scratch_bo {
 	uint32_t stride;
 };
 
-struct scratch_bo *create_scratch_bo(int fd);
+static int
+safe_ioctl(int fd, unsigned long request, void *arg)
+{
+	int ret;
+
+	do {
+		ret = ioctl(fd, request, arg);
+	} while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+
+	return ret;
+}
+
+static inline uint32_t
+align_u32(uint32_t u, uint32_t align)
+{
+	return (u + align - 1) & ~(align - 1);
+}
+
+static void
+copy_linear_to_ymajor(void *dst, void *src, uint32_t stride, uint32_t height)
+{
+	int tile_stride = stride / 128;
+	const int column_stride = 32 * 16;
+	int columns = stride / 16;
+
+	assert((stride & 127) == 0);
+
+	for (int y = 0; y < height; y += 2) {
+		int tile_y = y / 32;
+		int iy = y & 31;
+		void *s = src + y * stride;
+		void *d = dst + tile_y * tile_stride * 4096 + iy * 16;
+
+		for (int x = 0; x < columns; x++) {
+			__m128i lo = _mm_load_si128((s + x * 16));
+			__m128i hi = _mm_load_si128((s + x * 16 + stride));
+			__m256i p = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+			_mm256_store_si256((d + x * column_stride), p);
+		}
+	}
+}
+
+static void
+fill_tile(void *map, uint32_t width, uint32_t height, uint32_t stride)
+{
+	uint32_t bpp = 4;
+	void *shadow;
+	struct color { float r, g, b; } c[2] = {
+		{ drand48(), drand48(), drand48() },
+		{ drand48(), drand48(), drand48() },
+	};
+
+	const uint32_t point_count = rand() % 5 + 3;
+	const float v1 = drand48() * 0.2 + 0.1;
+	const float v0 = drand48() * 0.4;
+	const float phase = drand48() * M_PI;
+
+	shadow = malloc(height * stride * bpp);
+	for (uint32_t y = 0; y < height; y++) {
+		uint32_t *line = shadow + y * stride;
+		for (uint32_t x = 0; x < width; x++) {
+			float fx = (float) x - width / 2;
+			float fy = (float) y - height / 2;
+			float d = (fx * fx + fy * fy) / 300;
+			float a = atan2f(fy, fx) + phase;
+			float t = fmax(fmin(4 - d * (sin(a * point_count) * v1 + v0), 1.0f), 0.0f);
+
+			uint32_t r = (c[0].r * t + c[1].r * (1 - t)) * 255 + 0.5f;
+			uint32_t g = (c[0].g * t + c[1].g * (1 - t)) * 255 + 0.5f;
+			uint32_t b = (c[0].b * t + c[1].b * (1 - t)) * 255 + 0.5f;
+
+			line[x] = 0xff000000 | (b << 16) | (g << 8) | (r << 0);
+		}
+	}
+
+	copy_linear_to_ymajor(map, shadow, stride, height);
+	free(shadow);
+}
+
+struct tile {
+	GLuint texture;
+	uint32_t stride;
+	int gem_handle;
+};
+
+static const uint32_t tile_width = 256, tile_height = 256;
+
+static struct tile *
+create_tile(struct egl *egl, int fd, uint32_t width, uint32_t height)
+{
+	struct tile *tile;
+
+	assert(width == align_u32(width, 32));
+	assert(height == align_u32(height, 32));
+
+	tile = malloc(sizeof(*tile));
+	if (tile == NULL)
+		return NULL;
+
+	uint32_t bpp = 4;
+	tile->stride = width * bpp; /* multiple of 128 */
+	uint32_t size = tile->stride * height;
+
+	struct drm_i915_gem_create_v2 gem_create = {
+		.size = size
+	};
+
+	int ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &gem_create);
+	if (ret < 0)
+		return NULL;
+
+	tile->gem_handle = gem_create.handle;
+
+	struct drm_prime_handle prime_handle = {
+		.handle = gem_create.handle,
+		.flags = DRM_CLOEXEC,
+	};
+
+	/* Shouldn't have to set tiling, the modifier in import should
+	 * override... but it doesn't. */
+	do {
+		struct drm_i915_gem_set_tiling set_tiling = {
+			.handle = tile->gem_handle,
+			.tiling_mode = I915_TILING_Y,
+			.stride = tile->stride,
+		};
+
+		ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_SET_TILING, &set_tiling);
+	} while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+
+	struct drm_i915_gem_mmap gem_mmap = {
+		.handle = tile->gem_handle,
+		.offset = 0,
+		.size = size,
+		.flags = 0,
+	};
+
+	ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_MMAP, &gem_mmap);
+	if (ret != 0)
+		return NULL;
+
+	void *map = (void *)(long)gem_mmap.addr_ptr;
+	fill_tile(map, width, height, tile->stride);
+	munmap(map, size);
+
+	ret = safe_ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime_handle);
+	if (ret == -1)
+		return NULL;
+
+	const EGLint attr[] = {
+		EGL_WIDTH, width,
+		EGL_HEIGHT, height,
+		EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ABGR8888,
+		EGL_DMA_BUF_PLANE0_FD_EXT, prime_handle.fd,
+		EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+		EGL_DMA_BUF_PLANE0_PITCH_EXT, tile->stride,
+		EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (uint32_t) I915_FORMAT_MOD_Y_TILED,
+		EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (uint32_t) (I915_FORMAT_MOD_Y_TILED >> 32),
+		EGL_NONE
+	};
+	EGLImage img;
+
+	glGenTextures(1, &tile->texture);
+
+	img = egl->eglCreateImageKHR(egl->display, EGL_NO_CONTEXT,
+			EGL_LINUX_DMA_BUF_EXT, NULL, attr);
+	assert(img);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, tile->texture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	egl->glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img);
+
+	egl->eglDestroyImageKHR(egl->display, img);
+
+	return tile;
+}
+
+static struct scratch_bo *
+create_scratch_bo(struct gpu_scroller *scroller)
+{
+	struct scratch_bo *sbo = malloc(sizeof(*sbo));
+	int fd = gbm_device_get_fd(scroller->dev);
+
+	uint32_t scratch_width = 4096;
+	uint32_t scratch_height = 4096;
+	sbo->stride = scratch_width * 4;
+	uint32_t scratch_size = sbo->stride * scratch_height;
+	struct drm_i915_gem_create_v2 scratch_create = {
+		.size = scratch_size,
+		.flags = I915_GEM_CREATE_SCRATCH
+	};
+
+	int ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &scratch_create);
+	if (ret < 0) {
+		fprintf(stderr, "scratch gem create v2 failed: %s\n", strerror(errno));
+		return NULL;
+	}
+
+	sbo->gem_handle = scratch_create.handle;
+
+	uint32_t tile = 0, tile_stride = scroller->tiles[0]->stride;
+	for (uint32_t i = 0; i < sbo->stride / 128; i += tile_stride / 128) {
+		/* All offsets, stride, width and height are in pages */
+		struct drm_i915_gem_set_pages set_pages = {
+			.dst_handle = scratch_create.handle,
+			.src_handle = scroller->tiles[tile % ARRAY_SIZE(scroller->tiles)]->gem_handle,
+
+			.dst_offset = i,
+			.src_offset = 0,
+
+			/* A Y tile is 128 bytes wide, so divide the stride by
+			 * 128 to find the number of tiles (ie pages). */
+			.dst_stride = sbo->stride / 128,
+			.src_stride = tile_stride / 128,
+
+			/* Again, divide stride by 128 to get the width of the
+			 * region in tiles. Y tiles are 32 lines high, so
+			 * divide height by 32 to get height in number of
+			 * pages. */
+			.width = tile_stride / 128,
+			.height = tile_height / 32,
+		};
+
+		ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_SET_PAGES, &set_pages);
+		if (ret < 0) {
+			fprintf(stderr, "tile gem create v2 failed: %s\n", strerror(errno));
+			return NULL;
+		}
+		tile++;
+	}
+
+	return sbo;
+}
 
 static void
 drm_fb_destroy_callback(struct gbm_bo *bo, void *data)
@@ -138,7 +382,7 @@ drm_fb_destroy_callback(struct gbm_bo *bo, void *data)
 }
 
 static struct drm_fb *
-drm_fb_get_from_bo(struct gbm_bo *bo)
+drm_fb_get_from_bo(struct gpu_scroller *scroller, struct gbm_bo *bo)
 {
 	int drm_fd = gbm_device_get_fd(gbm_bo_get_device(bo));
 	struct drm_fb *fb = gbm_bo_get_user_data(bo);
@@ -159,7 +403,7 @@ drm_fb_get_from_bo(struct gbm_bo *bo)
 	uint64_t modifiers[4] = { I915_FORMAT_MOD_Y_TILED, };
 
 #if 0
-	struct scratch_bo *sbo = create_scratch_bo(drm_fd);
+	struct scratch_bo *sbo = create_scratch_bo(scroller);
 	handles[0] = sbo->gem_handle;
 	strides[0] = sbo->stride;
 #endif
@@ -513,120 +757,6 @@ init_drm(const char *device)
 	return &drm;
 }
 
-static struct termios save_tio;
-
-static void restore_vt(void)
-{
-	struct vt_mode mode = { .mode = VT_AUTO };
-	ioctl(STDIN_FILENO, VT_SETMODE, &mode);
-
-	tcsetattr(STDIN_FILENO, TCSANOW, &save_tio);
-	ioctl(STDIN_FILENO, KDSETMODE, KD_TEXT);
-}
-
-static void handle_signal(int sig)
-{
-	restore_vt();
-
-	raise(sig);
-}
-
-static int init_vt(void)
-{
-	struct termios tio;
-	struct stat buf;
-	int ret;
-
-	/* If we're not on a VT, we're probably logged in as root over
-	 * ssh. Skip all this then. */
-	ret = fstat(STDIN_FILENO, &buf);
-	if (ret == -1 || major(buf.st_rdev) != TTY_MAJOR)
-		return 0;
-
-	/* First, save term io setting so we can restore properly. */
-	tcgetattr(STDIN_FILENO, &save_tio);
-
-	/* We don't drop drm master, so block VT switching while we're
-	 * running. Otherwise, switching to X on another VT will crash X when it
-	 * fails to get drm master. */
-	struct vt_mode mode = { .mode = VT_PROCESS, .relsig = 0, .acqsig = 0 };
-	ret = ioctl(STDIN_FILENO, VT_SETMODE, &mode);
-	if (ret == -1) {
-		printf("failed to take control of vt handling\n");
-		return -1;
-	}
-
-	/* Set KD_GRAPHICS to disable fbcon while we render. */
-	ret = ioctl(STDIN_FILENO, KDSETMODE, KD_GRAPHICS);
-	if (ret == -1) {
-		printf("failed to switch console to graphics mode\n");
-		return -1;
-	}
-
-	atexit(restore_vt);
-
-	/* Set console input to raw mode. */
-	tio = save_tio;
-	tio.c_lflag &= ~(ICANON | ECHO);
-	tcsetattr(STDIN_FILENO, TCSANOW, &tio);
-
-	/* Restore console on SIGINT and friends. */
-	struct sigaction act = {
-		.sa_handler = handle_signal,
-		.sa_flags = SA_RESETHAND
-	};
-	sigaction(SIGINT, &act, NULL);
-	sigaction(SIGSEGV, &act, NULL);
-	sigaction(SIGABRT, &act, NULL);
-
-	return 0;
-}
-
-static const uint32_t tile_width = 256, tile_height = 256;
-
-struct {
-	struct egl egl;
-
-	GLuint program;
-	/* uniform handles: */
-	GLint texture;
-	GLuint vbo;
-
-	struct tile *tiles[64];
-} gl;
-
-const struct egl *egl = &gl.egl;
-
-static struct gpu_scroller *
-create_gpu_scroller(const char *device)
-{
-	struct gpu_scroller *scroller = malloc(sizeof(*scroller));
-	struct drm *drm;
-
-	drm = init_drm(device);
-	if (!drm) {
-		printf("failed to initialize atomic DRM\n");
-		return NULL;
-	}
-
-	scroller->dev = gbm_create_device(drm->fd);
-	scroller->width = drm->mode->hdisplay - 200;
-	scroller->height = drm->mode->vdisplay - 200;
-
-	static const uint64_t modifiers[] = { I915_FORMAT_MOD_Y_TILED };
-	scroller->surface = gbm_surface_create_with_modifiers(scroller->dev,
-							      scroller->width,
-							      scroller->height,
-							      GBM_FORMAT_XRGB8888,
-							      modifiers, ARRAY_SIZE(modifiers));
-	if (!scroller->surface) {
-		printf("failed to create gbm surface\n");
-		return NULL;
-	}
-
-	return scroller;
-}
-
 static bool has_ext(const char *extension_list, const char *ext)
 {
 	const char *ptr = extension_list;
@@ -888,183 +1018,85 @@ static const char *fragment_shader_source =
 	"    frag_color = texture(uTex, vTexCoord);\n"
 	"}\n";
 
-
 static int
-safe_ioctl(int fd, unsigned long request, void *arg)
+init_gl(struct gpu_scroller *scroller)
 {
 	int ret;
 
-	do {
-		ret = ioctl(fd, request, arg);
-	} while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+	ret = init_egl(&scroller->egl, scroller);
+	if (ret)
+		return ret;
 
-	return ret;
-}
-
-static inline uint32_t
-align_u32(uint32_t u, uint32_t align)
-{
-	return (u + align - 1) & ~(align - 1);
-}
-
-static void
-copy_linear_to_ymajor(void *dst, void *src, uint32_t stride, uint32_t height)
-{
-	int tile_stride = stride / 128;
-	const int column_stride = 32 * 16;
-	int columns = stride / 16;
-
-	assert((stride & 127) == 0);
-
-	for (int y = 0; y < height; y += 2) {
-		int tile_y = y / 32;
-		int iy = y & 31;
-		void *s = src + y * stride;
-		void *d = dst + tile_y * tile_stride * 4096 + iy * 16;
-
-		for (int x = 0; x < columns; x++) {
-			__m128i lo = _mm_load_si128((s + x * 16));
-			__m128i hi = _mm_load_si128((s + x * 16 + stride));
-			__m256i p = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
-			_mm256_store_si256((d + x * column_stride), p);
-		}
-	}
-}
-
-static void
-fill_tile(void *map, uint32_t width, uint32_t height, uint32_t stride)
-{
-	uint32_t bpp = 4;
-	void *shadow;
-	struct color { float r, g, b; } c[2] = {
-		{ drand48(), drand48(), drand48() },
-		{ drand48(), drand48(), drand48() },
-	};
-
-	const uint32_t point_count = rand() % 5 + 3;
-	const float v1 = drand48() * 0.2 + 0.1;
-	const float v0 = drand48() * 0.4;
-	const float phase = drand48() * M_PI;
-
-	shadow = malloc(height * stride * bpp);
-	for (uint32_t y = 0; y < height; y++) {
-		uint32_t *line = shadow + y * stride;
-		for (uint32_t x = 0; x < width; x++) {
-			float fx = (float) x - width / 2;
-			float fy = (float) y - height / 2;
-			float d = (fx * fx + fy * fy) / 300;
-			float a = atan2f(fy, fx) + phase;
-			float t = fmax(fmin(4 - d * (sin(a * point_count) * v1 + v0), 1.0f), 0.0f);
-
-			uint32_t r = (c[0].r * t + c[1].r * (1 - t)) * 255 + 0.5f;
-			uint32_t g = (c[0].g * t + c[1].g * (1 - t)) * 255 + 0.5f;
-			uint32_t b = (c[0].b * t + c[1].b * (1 - t)) * 255 + 0.5f;
-
-			line[x] = 0xff000000 | (b << 16) | (g << 8) | (r << 0);
-		}
-	}
-
-	copy_linear_to_ymajor(map, shadow, stride, height);
-	free(shadow);
-}
-
-struct tile {
-	GLuint texture;
-	uint32_t stride;
-	int gem_handle;
-};
-
-static struct tile *
-create_tile(int fd, uint32_t width, uint32_t height)
-{
-	struct tile *tile;
-
-	assert(width == align_u32(width, 32));
-	assert(height == align_u32(height, 32));
-
-	tile = malloc(sizeof(*tile));
-	if (tile == NULL)
-		return NULL;
-
-	uint32_t bpp = 4;
-	tile->stride = width * bpp; /* multiple of 128 */
-	uint32_t size = tile->stride * height;
-
-	struct drm_i915_gem_create_v2 gem_create = {
-		.size = size
-	};
-
-	int ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &gem_create);
+	ret = create_program(vertex_shader_source, fragment_shader_source);
 	if (ret < 0)
+		return ret;
+
+	scroller->program = ret;
+
+	glBindAttribLocation(scroller->program, 0, "in_position");
+	glBindAttribLocation(scroller->program, 1, "in_TexCoord");
+
+	ret = link_program(scroller->program);
+	if (ret)
+		return ret;
+
+	glUseProgram(scroller->program);
+
+	scroller->texture = glGetUniformLocation(scroller->program, "uTex");
+
+	glViewport(0, 0, scroller->width, scroller->height);
+
+	int drm_fd = gbm_device_get_fd(scroller->dev);
+	for (uint32_t i = 0; i < ARRAY_SIZE(scroller->tiles); i++) {
+		scroller->tiles[i] = create_tile(&scroller->egl, drm_fd, tile_width, tile_height);
+		if (scroller->tiles[i] == NULL) {
+			printf("failed to initialize EGLImage texture\n");
+			return -1;
+		}
+	}
+
+	glGenBuffers(1, &scroller->vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, scroller->vbo);
+	glBufferData(GL_ARRAY_BUFFER, 4096, 0, GL_STATIC_DRAW);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const GLvoid *)(intptr_t)0);
+	glEnableVertexAttribArray(0);
+
+	return 0;
+}
+
+static struct gpu_scroller *
+create_gpu_scroller(const char *device)
+{
+	struct gpu_scroller *scroller = malloc(sizeof(*scroller));
+	struct drm *drm;
+
+	drm = init_drm(device);
+	if (!drm) {
+		printf("failed to initialize atomic DRM\n");
 		return NULL;
+	}
 
-	tile->gem_handle = gem_create.handle;
+	scroller->dev = gbm_create_device(drm->fd);
+	scroller->width = drm->mode->hdisplay - 200;
+	scroller->height = drm->mode->vdisplay - 200;
 
-	struct drm_prime_handle prime_handle = {
-		.handle = gem_create.handle,
-		.flags = DRM_CLOEXEC,
-	};
-
-	/* Shouldn't have to set tiling, the modifier in import should
-	 * override... but it doesn't. */
-	do {
-		struct drm_i915_gem_set_tiling set_tiling = {
-			.handle = tile->gem_handle,
-			.tiling_mode = I915_TILING_Y,
-			.stride = tile->stride,
-		};
-
-		ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_SET_TILING, &set_tiling);
-	} while (ret == -1 && (errno == EINTR || errno == EAGAIN));
-
-	struct drm_i915_gem_mmap gem_mmap = {
-		.handle = tile->gem_handle,
-		.offset = 0,
-		.size = size,
-		.flags = 0,
-	};
-
-	ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_MMAP, &gem_mmap);
-	if (ret != 0)
+	static const uint64_t modifiers[] = { I915_FORMAT_MOD_Y_TILED };
+	scroller->surface = gbm_surface_create_with_modifiers(scroller->dev,
+							      scroller->width,
+							      scroller->height,
+							      GBM_FORMAT_XRGB8888,
+							      modifiers, ARRAY_SIZE(modifiers));
+	if (!scroller->surface) {
+		printf("failed to create gbm surface\n");
 		return NULL;
+	}
 
-	void *map = (void *)(long)gem_mmap.addr_ptr;
-	fill_tile(map, width, height, tile->stride);
-	munmap(map, size);
-
-	ret = safe_ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime_handle);
-	if (ret == -1)
+	if (init_gl(scroller) < 0) {
+		printf("failed to initialize gl\n");
 		return NULL;
+	}
 
-	const EGLint attr[] = {
-		EGL_WIDTH, width,
-		EGL_HEIGHT, height,
-		EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ABGR8888,
-		EGL_DMA_BUF_PLANE0_FD_EXT, prime_handle.fd,
-		EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-		EGL_DMA_BUF_PLANE0_PITCH_EXT, tile->stride,
-		EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (uint32_t) I915_FORMAT_MOD_Y_TILED,
-		EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (uint32_t) (I915_FORMAT_MOD_Y_TILED >> 32),
-		EGL_NONE
-	};
-	EGLImage img;
-
-	glGenTextures(1, &tile->texture);
-
-	img = egl->eglCreateImageKHR(egl->display, EGL_NO_CONTEXT,
-			EGL_LINUX_DMA_BUF_EXT, NULL, attr);
-	assert(img);
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, tile->texture);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	egl->glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img);
-
-	egl->eglDestroyImageKHR(egl->display, img);
-
-	return tile;
+	return scroller;
 }
 
 static void draw_cube_tex(struct gpu_scroller *scroller,
@@ -1072,7 +1104,7 @@ static void draw_cube_tex(struct gpu_scroller *scroller,
 {
 	glClearColor(0.5, 0.5, 0.5, 1.0);
 	glClear(GL_COLOR_BUFFER_BIT);
-	glUniform1i(gl.texture, 0);
+	glUniform1i(scroller->texture, 0);
 
 	uint32_t tile_x = offset_x / tile_width;
 	uint32_t tile_offset_x = offset_x & (tile_width - 1);
@@ -1101,7 +1133,7 @@ static void draw_cube_tex(struct gpu_scroller *scroller,
 			};
 
 			glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), &vertices[0]);
-			glBindTexture(GL_TEXTURE_2D, gl.tiles[tile_index & (ARRAY_SIZE(gl.tiles) - 1)]->texture);
+			glBindTexture(GL_TEXTURE_2D, scroller->tiles[tile_index & (ARRAY_SIZE(scroller->tiles) - 1)]->texture);
 
 			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
@@ -1110,57 +1142,11 @@ static void draw_cube_tex(struct gpu_scroller *scroller,
 	}
 }
 
-static struct egl *
-init_cube_tex(struct gpu_scroller *scroller)
-{
-	int ret;
-
-	ret = init_egl(&gl.egl, scroller);
-	if (ret)
-		return NULL;
-
-	ret = create_program(vertex_shader_source, fragment_shader_source);
-	if (ret < 0)
-		return NULL;
-
-	gl.program = ret;
-
-	glBindAttribLocation(gl.program, 0, "in_position");
-	glBindAttribLocation(gl.program, 1, "in_TexCoord");
-
-	ret = link_program(gl.program);
-	if (ret)
-		return NULL;
-
-	glUseProgram(gl.program);
-
-	gl.texture = glGetUniformLocation(gl.program, "uTex");
-
-	glViewport(0, 0, scroller->width, scroller->height);
-
-	int drm_fd = gbm_device_get_fd(scroller->dev);
-	for (uint32_t i = 0; i < ARRAY_SIZE(gl.tiles); i++) {
-		gl.tiles[i] = create_tile(drm_fd, tile_width, tile_height);
-		if (gl.tiles[i] == NULL) {
-			printf("failed to initialize EGLImage texture\n");
-			return NULL;
-		}
-	}
-
-	glGenBuffers(1, &gl.vbo);
-	glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
-	glBufferData(GL_ARRAY_BUFFER, 4096, 0, GL_STATIC_DRAW);
-	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const GLvoid *)(intptr_t)0);
-	glEnableVertexAttribArray(0);
-
-	return &gl.egl;
-}
-
 static int
-gpu_scroller_draw(struct gpu_scroller *scroller, const struct egl *egl,
-		  uint32_t offset_x, uint32_t offset_y)
+gpu_scroller_draw(struct gpu_scroller *scroller, uint32_t offset_x, uint32_t offset_y)
 {
 	struct drm_fb *fb;
+	struct egl *egl = &scroller->egl;
 	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
 	int ret;
 
@@ -1208,7 +1194,7 @@ gpu_scroller_draw(struct gpu_scroller *scroller, const struct egl *egl,
 		printf("Failed to lock frontbuffer\n");
 		return -1;
 	}
-	fb = drm_fb_get_from_bo(next_bo);
+	fb = drm_fb_get_from_bo(scroller, next_bo);
 	if (!fb) {
 		printf("Failed to get a new framebuffer BO\n");
 		return -1;
@@ -1250,62 +1236,6 @@ gpu_scroller_draw(struct gpu_scroller *scroller, const struct egl *egl,
 	return 0;
 }
 
-struct scratch_bo *
-create_scratch_bo(int fd)
-{
-	struct scratch_bo *sbo = malloc(sizeof(*sbo));
-
-	uint32_t scratch_width = 4096;
-	uint32_t scratch_height = 4096;
-	sbo->stride = scratch_width * 4;
-	uint32_t scratch_size = sbo->stride * scratch_height;
-	struct drm_i915_gem_create_v2 scratch_create = {
-		.size = scratch_size,
-		.flags = I915_GEM_CREATE_SCRATCH
-	};
-
-	int ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &scratch_create);
-	if (ret < 0) {
-		fprintf(stderr, "scratch gem create v2 failed: %s\n", strerror(errno));
-		return NULL;
-	}
-
-	sbo->gem_handle = scratch_create.handle;
-
-	uint32_t tile = 0, tile_stride = gl.tiles[0]->stride;
-	for (uint32_t i = 0; i < sbo->stride / 128; i += tile_stride / 128) {
-		/* All offsets, stride, width and height are in pages */
-		struct drm_i915_gem_set_pages set_pages = {
-			.dst_handle = scratch_create.handle,
-			.src_handle = gl.tiles[tile % ARRAY_SIZE(gl.tiles)]->gem_handle,
-
-			.dst_offset = i,
-			.src_offset = 0,
-
-			/* A Y tile is 128 bytes wide, so divide the stride by
-			 * 128 to find the number of tiles (ie pages). */
-			.dst_stride = sbo->stride / 128,
-			.src_stride = tile_stride / 128,
-
-			/* Again, divide stride by 128 to get the width of the
-			 * region in tiles. Y tiles are 32 lines high, so
-			 * divide height by 32 to get height in number of
-			 * pages. */
-			.width = tile_stride / 128,
-			.height = tile_height / 32,
-		};
-
-		ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_SET_PAGES, &set_pages);
-		if (ret < 0) {
-			fprintf(stderr, "tile gem create v2 failed: %s\n", strerror(errno));
-			return NULL;
-		}
-		tile++;
-	}
-
-	return sbo;
-}
-
 static const char *shortopts = "D:";
 
 static const struct option longopts[] = {
@@ -1322,11 +1252,79 @@ static void usage(const char *name)
 	       name);
 }
 
+static struct termios save_tio;
+
+static void restore_vt(void)
+{
+	struct vt_mode mode = { .mode = VT_AUTO };
+	ioctl(STDIN_FILENO, VT_SETMODE, &mode);
+
+	tcsetattr(STDIN_FILENO, TCSANOW, &save_tio);
+	ioctl(STDIN_FILENO, KDSETMODE, KD_TEXT);
+}
+
+static void handle_signal(int sig)
+{
+	restore_vt();
+
+	raise(sig);
+}
+
+static int init_vt(void)
+{
+	struct termios tio;
+	struct stat buf;
+	int ret;
+
+	/* If we're not on a VT, we're probably logged in as root over
+	 * ssh. Skip all this then. */
+	ret = fstat(STDIN_FILENO, &buf);
+	if (ret == -1 || major(buf.st_rdev) != TTY_MAJOR)
+		return 0;
+
+	/* First, save term io setting so we can restore properly. */
+	tcgetattr(STDIN_FILENO, &save_tio);
+
+	/* We don't drop drm master, so block VT switching while we're
+	 * running. Otherwise, switching to X on another VT will crash X when it
+	 * fails to get drm master. */
+	struct vt_mode mode = { .mode = VT_PROCESS, .relsig = 0, .acqsig = 0 };
+	ret = ioctl(STDIN_FILENO, VT_SETMODE, &mode);
+	if (ret == -1) {
+		printf("failed to take control of vt handling\n");
+		return -1;
+	}
+
+	/* Set KD_GRAPHICS to disable fbcon while we render. */
+	ret = ioctl(STDIN_FILENO, KDSETMODE, KD_GRAPHICS);
+	if (ret == -1) {
+		printf("failed to switch console to graphics mode\n");
+		return -1;
+	}
+
+	atexit(restore_vt);
+
+	/* Set console input to raw mode. */
+	tio = save_tio;
+	tio.c_lflag &= ~(ICANON | ECHO);
+	tcsetattr(STDIN_FILENO, TCSANOW, &tio);
+
+	/* Restore console on SIGINT and friends. */
+	struct sigaction act = {
+		.sa_handler = handle_signal,
+		.sa_flags = SA_RESETHAND
+	};
+	sigaction(SIGINT, &act, NULL);
+	sigaction(SIGSEGV, &act, NULL);
+	sigaction(SIGABRT, &act, NULL);
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	const char *device = "/dev/dri/card0";
 	int opt;
-	struct egl *egl;
 	struct gpu_scroller *scroller;
 
 	while ((opt = getopt_long_only(argc, argv, shortopts, longopts, NULL)) != -1) {
@@ -1346,12 +1344,6 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	egl = init_cube_tex(scroller);
-	if (!egl) {
-		printf("failed to initialize EGL\n");
-		return -1;
-	}
-
 	if (init_vt())
 		return -1;
 
@@ -1363,7 +1355,7 @@ int main(int argc, char *argv[])
 		const uint32_t offset_y = sin((i & 255) / 256.0f * 2 * M_PI) * 150 + 200;
 		i++;
 
-		ret = gpu_scroller_draw(scroller, egl, offset_x, offset_y);
+		ret = gpu_scroller_draw(scroller, offset_x, offset_y);
 	}
 
 	return 0;
