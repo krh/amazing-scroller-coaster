@@ -1292,13 +1292,12 @@ create_scratch_bo(void)
 
 	sbo->gem_handle = scratch_create.handle;
 
-	struct tile *tile = create_tile(tile_width, tile_height);
-
-	for (uint32_t i = 0; i < sbo->stride / 128; i += tile->stride / 128) {
+	uint32_t tile = 0, tile_stride = gl.tiles[0]->stride;
+	for (uint32_t i = 0; i < sbo->stride / 128; i += tile_stride / 128) {
 		/* All offsets, stride, width and height are in pages */
 		struct drm_i915_gem_set_pages set_pages = {
 			.dst_handle = scratch_create.handle,
-			.src_handle = tile->gem_handle,
+			.src_handle = gl.tiles[tile % ARRAY_SIZE(gl.tiles)]->gem_handle,
 
 			.dst_offset = i,
 			.src_offset = 0,
@@ -1306,13 +1305,13 @@ create_scratch_bo(void)
 			/* A Y tile is 128 bytes wide, so divide the stride by
 			 * 128 to find the number of tiles (ie pages). */
 			.dst_stride = sbo->stride / 128,
-			.src_stride = tile->stride / 128,
+			.src_stride = tile_stride / 128,
 
 			/* Again, divide stride by 128 to get the width of the
 			 * region in tiles. Y tiles are 32 lines high, so
 			 * divide height by 32 to get height in number of
 			 * pages. */
-			.width = tile->stride / 128,
+			.width = tile_stride / 128,
 			.height = tile_height / 32,
 		};
 
@@ -1321,6 +1320,7 @@ create_scratch_bo(void)
 			fprintf(stderr, "tile gem create v2 failed: %s\n", strerror(errno));
 			return NULL;
 		}
+		tile++;
 	}
 
 	return sbo;
