@@ -64,7 +64,7 @@
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-struct gbm {
+struct gpu_scroller {
 	struct gbm_device *dev;
 	struct gbm_surface *surface;
 	int width, height;
@@ -123,7 +123,7 @@ struct scratch_bo {
 	uint32_t stride;
 };
 
-struct scratch_bo *create_scratch_bo(void);
+struct scratch_bo *create_scratch_bo(int fd);
 
 static void
 drm_fb_destroy_callback(struct gbm_bo *bo, void *data)
@@ -159,7 +159,7 @@ drm_fb_get_from_bo(struct gbm_bo *bo)
 	uint64_t modifiers[4] = { I915_FORMAT_MOD_Y_TILED, };
 
 #if 0
-	struct scratch_bo *sbo = create_scratch_bo();
+	struct scratch_bo *sbo = create_scratch_bo(drm_fd);
 	handles[0] = sbo->gem_handle;
 	strides[0] = sbo->stride;
 #endif
@@ -587,8 +587,6 @@ static const uint32_t tile_width = 256, tile_height = 256;
 struct {
 	struct egl egl;
 
-	const struct gbm *gbm;
-
 	GLuint program;
 	/* uniform handles: */
 	GLint texture;
@@ -599,25 +597,26 @@ struct {
 
 const struct egl *egl = &gl.egl;
 
-static struct gbm gbm;
-
-static struct gbm *
-init_gbm(int drm_fd, int w, int h, uint64_t modifier)
+static struct gpu_scroller *
+create_gpu_scroller(int drm_fd, int w, int h, uint64_t modifier)
 {
-	gbm.dev = gbm_create_device(drm_fd);
-	uint64_t modifiers[] = { I915_FORMAT_MOD_Y_TILED };
-	gbm.surface = gbm_surface_create_with_modifiers(gbm.dev, w, h,
-							GBM_FORMAT_XRGB8888,
-							modifiers, ARRAY_SIZE(modifiers));
-	if (!gbm.surface) {
+	struct gpu_scroller *scroller = malloc(sizeof(*scroller));
+
+	scroller->dev = gbm_create_device(drm_fd);
+
+	static const uint64_t modifiers[] = { I915_FORMAT_MOD_Y_TILED };
+	scroller->surface = gbm_surface_create_with_modifiers(scroller->dev, w, h,
+							      GBM_FORMAT_XRGB8888,
+							      modifiers, ARRAY_SIZE(modifiers));
+	if (!scroller->surface) {
 		printf("failed to create gbm surface\n");
 		return NULL;
 	}
 
-	gbm.width = w;
-	gbm.height = h;
+	scroller->width = w;
+	scroller->height = h;
 
-	return &gbm;
+	return scroller;
 }
 
 static bool has_ext(const char *extension_list, const char *ext)
@@ -652,7 +651,7 @@ static inline int __egl_check(void *ptr, const char *name)
 #define egl_check(egl, name) __egl_check((egl)->name, #name)
 
 static int
-init_egl(struct egl *egl, const struct gbm *gbm)
+init_egl(struct egl *egl, struct gpu_scroller *scroller)
 {
 	EGLint major, minor, n;
 
@@ -691,9 +690,9 @@ init_egl(struct egl *egl, const struct gbm *gbm)
 
 	if (egl->eglGetPlatformDisplayEXT) {
 		egl->display = egl->eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR,
-				gbm->dev, NULL);
+				scroller->dev, NULL);
 	} else {
-		egl->display = eglGetDisplay((void *)gbm->dev);
+		egl->display = eglGetDisplay((void *)scroller->dev);
 	}
 
 	if (!eglInitialize(egl->display, &major, &minor)) {
@@ -739,7 +738,7 @@ init_egl(struct egl *egl, const struct gbm *gbm)
 	}
 
 	egl->surface = eglCreateWindowSurface(egl->display, egl->config,
-			(EGLNativeWindowType)gbm->surface, NULL);
+			(EGLNativeWindowType)scroller->surface, NULL);
 	if (egl->surface == EGL_NO_SURFACE) {
 		printf("failed to create egl surface\n");
 		return -1;
@@ -883,9 +882,8 @@ static const char *fragment_shader_source =
 
 
 static int
-safe_ioctl(unsigned long request, void *arg)
+safe_ioctl(int fd, unsigned long request, void *arg)
 {
-	int fd = gbm_device_get_fd(gl.gbm->dev);
 	int ret;
 
 	do {
@@ -969,7 +967,7 @@ struct tile {
 };
 
 static struct tile *
-create_tile(uint32_t width, uint32_t height)
+create_tile(int fd, uint32_t width, uint32_t height)
 {
 	struct tile *tile;
 
@@ -988,7 +986,7 @@ create_tile(uint32_t width, uint32_t height)
 		.size = size
 	};
 
-	int ret = safe_ioctl(DRM_IOCTL_I915_GEM_CREATE, &gem_create);
+	int ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &gem_create);
 	if (ret < 0)
 		return NULL;
 
@@ -1008,7 +1006,7 @@ create_tile(uint32_t width, uint32_t height)
 			.stride = tile->stride,
 		};
 
-		ret = safe_ioctl(DRM_IOCTL_I915_GEM_SET_TILING, &set_tiling);
+		ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_SET_TILING, &set_tiling);
 	} while (ret == -1 && (errno == EINTR || errno == EAGAIN));
 
 	struct drm_i915_gem_mmap gem_mmap = {
@@ -1018,7 +1016,7 @@ create_tile(uint32_t width, uint32_t height)
 		.flags = 0,
 	};
 
-	ret = safe_ioctl(DRM_IOCTL_I915_GEM_MMAP, &gem_mmap);
+	ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_MMAP, &gem_mmap);
 	if (ret != 0)
 		return NULL;
 
@@ -1026,7 +1024,7 @@ create_tile(uint32_t width, uint32_t height)
 	fill_tile(map, width, height, tile->stride);
 	munmap(map, size);
 
-	ret = safe_ioctl(DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime_handle);
+	ret = safe_ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime_handle);
 	if (ret == -1)
 		return NULL;
 
@@ -1061,7 +1059,8 @@ create_tile(uint32_t width, uint32_t height)
 	return tile;
 }
 
-static void draw_cube_tex(uint32_t offset_x, uint32_t offset_y)
+static void draw_cube_tex(struct gpu_scroller *scroller,
+			  uint32_t offset_x, uint32_t offset_y)
 {
 	glClearColor(0.5, 0.5, 0.5, 1.0);
 	glClear(GL_COLOR_BUFFER_BIT);
@@ -1072,11 +1071,11 @@ static void draw_cube_tex(uint32_t offset_x, uint32_t offset_y)
 	uint32_t tile_y = offset_y / tile_height;
 	uint32_t tile_offset_y = offset_y & (tile_height - 1);
 
-	const float fw = 2 * tile_width / (float) gbm.width;
-	const float fh = 2 * tile_height / (float) gbm.height;
+	const float fw = 2 * tile_width / (float) scroller->width;
+	const float fh = 2 * tile_height / (float) scroller->height;
 
-	const float start_fx = -1.0f - 2 * tile_offset_x / (float) gbm.width;
-	const float start_fy =  1.0f + 2 * tile_offset_y / (float) gbm.height;
+	const float start_fx = -1.0f - 2 * tile_offset_x / (float) scroller->width;
+	const float start_fy =  1.0f + 2 * tile_offset_y / (float) scroller->height;
 
 	uint32_t tile_row = tile_y;
 
@@ -1104,15 +1103,13 @@ static void draw_cube_tex(uint32_t offset_x, uint32_t offset_y)
 }
 
 static struct egl *
-init_cube_tex(const struct gbm *gbm)
+init_cube_tex(struct gpu_scroller *scroller)
 {
 	int ret;
 
-	ret = init_egl(&gl.egl, gbm);
+	ret = init_egl(&gl.egl, scroller);
 	if (ret)
 		return NULL;
-
-	gl.gbm = gbm;
 
 	ret = create_program(vertex_shader_source, fragment_shader_source);
 	if (ret < 0)
@@ -1131,10 +1128,11 @@ init_cube_tex(const struct gbm *gbm)
 
 	gl.texture = glGetUniformLocation(gl.program, "uTex");
 
-	glViewport(0, 0, gbm->width, gbm->height);
+	glViewport(0, 0, scroller->width, scroller->height);
 
+	int drm_fd = gbm_device_get_fd(scroller->dev);
 	for (uint32_t i = 0; i < ARRAY_SIZE(gl.tiles); i++) {
-		gl.tiles[i] = create_tile(tile_width, tile_height);
+		gl.tiles[i] = create_tile(drm_fd, tile_width, tile_height);
 		if (gl.tiles[i] == NULL) {
 			printf("failed to initialize EGLImage texture\n");
 			return NULL;
@@ -1150,8 +1148,9 @@ init_cube_tex(const struct gbm *gbm)
 	return &gl.egl;
 }
 
-static int atomic_run(struct gbm *gbm, const struct egl *egl,
-		      uint32_t offset_x, uint32_t offset_y)
+static int
+gpu_scroller_draw(struct gpu_scroller *scroller, const struct egl *egl,
+		  uint32_t offset_x, uint32_t offset_y)
 {
 	struct drm_fb *fb;
 	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
@@ -1179,7 +1178,7 @@ static int atomic_run(struct gbm *gbm, const struct egl *egl,
 		egl->eglWaitSyncKHR(egl->display, kms_fence, 0);
 	}
 
-	draw_cube_tex(offset_x, offset_y);
+	draw_cube_tex(scroller, offset_x, offset_y);
 
 	/* insert fence to be singled in cmdstream.. this fence will be
 	 * signaled when gpu rendering done
@@ -1196,7 +1195,7 @@ static int atomic_run(struct gbm *gbm, const struct egl *egl,
 	egl->eglDestroySyncKHR(egl->display, gpu_fence);
 	assert(drm.kms_in_fence_fd != -1);
 
-	next_bo = gbm_surface_lock_front_buffer(gbm->surface);
+	next_bo = gbm_surface_lock_front_buffer(scroller->surface);
 	if (!next_bo) {
 		printf("Failed to lock frontbuffer\n");
 		return -1;
@@ -1236,15 +1235,15 @@ static int atomic_run(struct gbm *gbm, const struct egl *egl,
 	}
 
 	/* release last buffer to render on again: */
-	if (gbm->last_bo)
-		gbm_surface_release_buffer(gbm->surface, gbm->last_bo);
-	gbm->last_bo = next_bo;
+	if (scroller->last_bo)
+		gbm_surface_release_buffer(scroller->surface, scroller->last_bo);
+	scroller->last_bo = next_bo;
 
 	return 0;
 }
 
 struct scratch_bo *
-create_scratch_bo(void)
+create_scratch_bo(int fd)
 {
 	struct scratch_bo *sbo = malloc(sizeof(*sbo));
 
@@ -1257,7 +1256,7 @@ create_scratch_bo(void)
 		.flags = I915_GEM_CREATE_SCRATCH
 	};
 
-	int ret = safe_ioctl(DRM_IOCTL_I915_GEM_CREATE, &scratch_create);
+	int ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &scratch_create);
 	if (ret < 0) {
 		fprintf(stderr, "scratch gem create v2 failed: %s\n", strerror(errno));
 		return NULL;
@@ -1288,7 +1287,7 @@ create_scratch_bo(void)
 			.height = tile_height / 32,
 		};
 
-		ret = safe_ioctl(DRM_IOCTL_I915_GEM_SET_PAGES, &set_pages);
+		ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_SET_PAGES, &set_pages);
 		if (ret < 0) {
 			fprintf(stderr, "tile gem create v2 failed: %s\n", strerror(errno));
 			return NULL;
@@ -1324,7 +1323,7 @@ int main(int argc, char *argv[])
 	int opt;
 
 	struct egl *egl;
-	struct gbm *gbm;
+	struct gpu_scroller *scroller;
 	struct drm *drm;
 
 	while ((opt = getopt_long_only(argc, argv, shortopts, longopts, NULL)) != -1) {
@@ -1347,14 +1346,14 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	gbm = init_gbm(drm->fd, drm->mode->hdisplay - 200, drm->mode->vdisplay - 200,
-			modifier);
-	if (!gbm) {
+	scroller = create_gpu_scroller(drm->fd, drm->mode->hdisplay - 200, drm->mode->vdisplay - 200,
+				       modifier);
+	if (!scroller) {
 		printf("failed to initialize GBM\n");
 		return -1;
 	}
 
-	egl = init_cube_tex(gbm);
+	egl = init_cube_tex(scroller);
 	if (!egl) {
 		printf("failed to initialize EGL\n");
 		return -1;
@@ -1371,7 +1370,7 @@ int main(int argc, char *argv[])
 		const uint32_t offset_y = sin((i & 255) / 256.0f * 2 * M_PI) * 150 + 200;
 		i++;
 
-		ret = atomic_run(gbm, egl, offset_x, offset_y);
+		ret = gpu_scroller_draw(scroller, egl, offset_x, offset_y);
 	}
 
 	return 0;
