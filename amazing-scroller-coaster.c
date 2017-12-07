@@ -64,6 +64,14 @@
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
+#define container_of(ptr, type, member) ({				\
+	void *__mptr = (void *)(ptr);					\
+	((type *)(__mptr - offsetof(type, member))); })
+
+struct scroller {
+	int (*draw)(struct scroller *scroller, uint32_t offset_x, uint32_t offset_y);
+};
+
 struct egl {
 	EGLDisplay display;
 	EGLConfig config;
@@ -79,22 +87,6 @@ struct egl {
 	PFNEGLWAITSYNCKHRPROC eglWaitSyncKHR;
 	PFNEGLCLIENTWAITSYNCKHRPROC eglClientWaitSyncKHR;
 	PFNEGLDUPNATIVEFENCEFDANDROIDPROC eglDupNativeFenceFDANDROID;
-};
-
-struct gpu_scroller {
-	struct gbm_device *dev;
-	struct gbm_surface *surface;
-	int width, height;
-	struct gbm_bo *last_bo;
-
-	struct egl egl;
-
-	GLuint program;
-	/* uniform handles: */
-	GLint texture;
-	GLuint vbo;
-
-	struct tile *tiles[64];
 };
 
 struct props {
@@ -122,6 +114,25 @@ struct drm {
 	drmModeModeInfo *mode;
 };
 
+struct gpu_scroller {
+	struct scroller base;
+
+	struct gbm_device *dev;
+	struct gbm_surface *surface;
+	int width, height;
+	struct gbm_bo *last_bo;
+
+	struct drm drm;
+	struct egl egl;
+
+	GLuint program;
+	/* uniform handles: */
+	GLint texture;
+	GLuint vbo;
+
+	struct tile *tiles[64];
+};
+
 struct drm_fb {
 	struct gbm_bo *bo;
 	uint32_t fb_id;
@@ -130,6 +141,7 @@ struct drm_fb {
 struct scratch_bo {
 	uint32_t gem_handle;
 	uint32_t stride;
+	uint32_t fb_id;
 };
 
 static int
@@ -218,9 +230,10 @@ struct tile {
 };
 
 static const uint32_t tile_width = 256, tile_height = 256;
+static const uint32_t tile_row_stride = 29;
 
 static struct tile *
-create_tile(struct egl *egl, int fd, uint32_t width, uint32_t height)
+create_tile(int fd, uint32_t width, uint32_t height)
 {
 	struct tile *tile;
 
@@ -244,11 +257,6 @@ create_tile(struct egl *egl, int fd, uint32_t width, uint32_t height)
 		return NULL;
 
 	tile->gem_handle = gem_create.handle;
-
-	struct drm_prime_handle prime_handle = {
-		.handle = gem_create.handle,
-		.flags = DRM_CLOEXEC,
-	};
 
 	/* Shouldn't have to set tiling, the modifier in import should
 	 * override... but it doesn't. */
@@ -277,9 +285,23 @@ create_tile(struct egl *egl, int fd, uint32_t width, uint32_t height)
 	fill_tile(map, width, height, tile->stride);
 	munmap(map, size);
 
+	return tile;
+}
+
+static int
+create_texture_for_tile(int fd, struct egl *egl, struct tile *tile,
+			uint32_t width, uint32_t height)
+{
+	int ret;
+
+	struct drm_prime_handle prime_handle = {
+		.handle = tile->gem_handle,
+		.flags = DRM_CLOEXEC,
+	};
+
 	ret = safe_ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime_handle);
 	if (ret == -1)
-		return NULL;
+		return -1;
 
 	const EGLint attr[] = {
 		EGL_WIDTH, width,
@@ -292,13 +314,16 @@ create_tile(struct egl *egl, int fd, uint32_t width, uint32_t height)
 		EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (uint32_t) (I915_FORMAT_MOD_Y_TILED >> 32),
 		EGL_NONE
 	};
-	EGLImage img;
 
 	glGenTextures(1, &tile->texture);
 
-	img = egl->eglCreateImageKHR(egl->display, EGL_NO_CONTEXT,
-			EGL_LINUX_DMA_BUF_EXT, NULL, attr);
-	assert(img);
+	EGLImage img = egl->eglCreateImageKHR(egl->display, EGL_NO_CONTEXT,
+					      EGL_LINUX_DMA_BUF_EXT, NULL, attr);
+	if (img == NULL) {
+		printf("failed to create egl image\n");
+		return -1;
+	}
+
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, tile->texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -309,64 +334,7 @@ create_tile(struct egl *egl, int fd, uint32_t width, uint32_t height)
 
 	egl->eglDestroyImageKHR(egl->display, img);
 
-	return tile;
-}
-
-static struct scratch_bo *
-create_scratch_bo(struct gpu_scroller *scroller)
-{
-	struct scratch_bo *sbo = malloc(sizeof(*sbo));
-	int fd = gbm_device_get_fd(scroller->dev);
-
-	uint32_t scratch_width = 4096;
-	uint32_t scratch_height = 4096;
-	sbo->stride = scratch_width * 4;
-	uint32_t scratch_size = sbo->stride * scratch_height;
-	struct drm_i915_gem_create_v2 scratch_create = {
-		.size = scratch_size,
-		.flags = I915_GEM_CREATE_SCRATCH
-	};
-
-	int ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &scratch_create);
-	if (ret < 0) {
-		fprintf(stderr, "scratch gem create v2 failed: %s\n", strerror(errno));
-		return NULL;
-	}
-
-	sbo->gem_handle = scratch_create.handle;
-
-	uint32_t tile = 0, tile_stride = scroller->tiles[0]->stride;
-	for (uint32_t i = 0; i < sbo->stride / 128; i += tile_stride / 128) {
-		/* All offsets, stride, width and height are in pages */
-		struct drm_i915_gem_set_pages set_pages = {
-			.dst_handle = scratch_create.handle,
-			.src_handle = scroller->tiles[tile % ARRAY_SIZE(scroller->tiles)]->gem_handle,
-
-			.dst_offset = i,
-			.src_offset = 0,
-
-			/* A Y tile is 128 bytes wide, so divide the stride by
-			 * 128 to find the number of tiles (ie pages). */
-			.dst_stride = sbo->stride / 128,
-			.src_stride = tile_stride / 128,
-
-			/* Again, divide stride by 128 to get the width of the
-			 * region in tiles. Y tiles are 32 lines high, so
-			 * divide height by 32 to get height in number of
-			 * pages. */
-			.width = tile_stride / 128,
-			.height = tile_height / 32,
-		};
-
-		ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_SET_PAGES, &set_pages);
-		if (ret < 0) {
-			fprintf(stderr, "tile gem create v2 failed: %s\n", strerror(errno));
-			return NULL;
-		}
-		tile++;
-	}
-
-	return sbo;
+	return 0;
 }
 
 static void
@@ -402,14 +370,8 @@ drm_fb_get_from_bo(struct gpu_scroller *scroller, struct gbm_bo *bo)
 	uint32_t offsets[4] = { 0, };
 	uint64_t modifiers[4] = { I915_FORMAT_MOD_Y_TILED, };
 
-#if 0
-	struct scratch_bo *sbo = create_scratch_bo(scroller);
-	handles[0] = sbo->gem_handle;
-	strides[0] = sbo->stride;
-#endif
-
 	ret = drmModeAddFB2WithModifiers(drm_fd, width, height,
-			DRM_FORMAT_XRGB8888, handles, strides, offsets,
+			DRM_FORMAT_ABGR8888, handles, strides, offsets,
 			modifiers, &fb->fb_id, DRM_MODE_FB_MODIFIERS);
 
 	if (ret) {
@@ -445,10 +407,6 @@ find_crtc_for_connector(const struct drm *drm, const drmModeRes *resources,
 
 #define VOID2U64(x) ((uint64_t)(unsigned long)(x))
 
-static struct drm drm = {
-	.kms_out_fence_fd = -1,
-};
-
 static int add_property(drmModeAtomicReq *req, struct props *props,
 			uint32_t obj_id, const char *name, uint64_t value)
 {
@@ -470,74 +428,63 @@ static int add_property(drmModeAtomicReq *req, struct props *props,
 	return drmModeAtomicAddProperty(req, obj_id, prop_id, value);
 }
 
-static int add_connector_property(drmModeAtomicReq *req, uint32_t obj_id,
-				  const char *name, uint64_t value)
-{
-	return add_property(req, &drm.connector_props, obj_id, name, value);
-}
-
-static int add_crtc_property(drmModeAtomicReq *req, uint32_t obj_id,
-			     const char *name, uint64_t value)
-{
-	return add_property(req, &drm.crtc_props, obj_id, name, value);
-}
-
-static int add_plane_property(drmModeAtomicReq *req, uint32_t obj_id,
-			      const char *name, uint64_t value)
-{
-	return add_property(req, &drm.plane_props, obj_id, name, value);
-}
-
-static int drm_atomic_commit(struct drm_fb *fb, uint32_t flags)
+static int
+drm_atomic_commit(struct drm *drm, uint32_t fb_id,
+		  uint32_t x, uint32_t y,
+		  uint32_t width, uint32_t height, uint32_t flags)
 {
 	drmModeAtomicReq *req;
-	uint32_t plane_id = drm.plane->plane_id;
+	uint32_t plane_id = drm->plane->plane_id;
 	uint32_t blob_id;
-	uint32_t crtc_id = drm.crtc->crtc_id;
+	uint32_t crtc_id = drm->crtc->crtc_id;
 	int ret;
 
 	req = drmModeAtomicAlloc();
 
 	if (flags & DRM_MODE_ATOMIC_ALLOW_MODESET) {
-		if (add_connector_property(req, drm.connector->connector_id, "CRTC_ID",
-						crtc_id) < 0)
-				return -1;
+		if (add_property(req, &drm->connector_props,
+				 drm->connector->connector_id, "CRTC_ID",
+				 crtc_id) < 0)
+			return -1;
 
-		if (drmModeCreatePropertyBlob(drm.fd, drm.mode, sizeof(*drm.mode),
+		if (drmModeCreatePropertyBlob(drm->fd, drm->mode, sizeof(*drm->mode),
 					      &blob_id) != 0)
 			return -1;
 
-		if (add_crtc_property(req, crtc_id, "MODE_ID", blob_id) < 0)
+		if (add_property(req, &drm->crtc_props,
+				 crtc_id, "MODE_ID", blob_id) < 0)
 			return -1;
 
-		if (add_crtc_property(req, crtc_id, "ACTIVE", 1) < 0)
+		if (add_property(req, &drm->crtc_props,
+				 crtc_id, "ACTIVE", 1) < 0)
 			return -1;
 	}
 
-	add_plane_property(req, plane_id, "FB_ID", fb->fb_id);
-	add_plane_property(req, plane_id, "CRTC_ID", crtc_id);
-	add_plane_property(req, plane_id, "SRC_X", 0);
-	add_plane_property(req, plane_id, "SRC_Y", 0);
-	add_plane_property(req, plane_id, "SRC_W", gbm_bo_get_width(fb->bo) << 16);
-	add_plane_property(req, plane_id, "SRC_H", gbm_bo_get_height(fb->bo) << 16);
-	add_plane_property(req, plane_id, "CRTC_X", 100);
-	add_plane_property(req, plane_id, "CRTC_Y", 100);
-	add_plane_property(req, plane_id, "CRTC_W", gbm_bo_get_width(fb->bo));
-	add_plane_property(req, plane_id, "CRTC_H", gbm_bo_get_height(fb->bo));
+	add_property(req, &drm->plane_props, plane_id, "FB_ID", fb_id);
+	add_property(req, &drm->plane_props, plane_id, "CRTC_ID", crtc_id);
+	add_property(req, &drm->plane_props, plane_id, "SRC_X", x << 16);
+	add_property(req, &drm->plane_props, plane_id, "SRC_Y", y << 16);
+	add_property(req, &drm->plane_props, plane_id, "SRC_W", width << 16);
+	add_property(req, &drm->plane_props, plane_id, "SRC_H", height << 16);
+	add_property(req, &drm->plane_props, plane_id, "CRTC_X", 100);
+	add_property(req, &drm->plane_props, plane_id, "CRTC_Y", 100);
+	add_property(req, &drm->plane_props, plane_id, "CRTC_W", width);
+	add_property(req, &drm->plane_props, plane_id, "CRTC_H", height);
 
-	if (drm.kms_in_fence_fd != -1) {
-		add_crtc_property(req, crtc_id, "OUT_FENCE_PTR",
-				VOID2U64(&drm.kms_out_fence_fd));
-		add_plane_property(req, plane_id, "IN_FENCE_FD", drm.kms_in_fence_fd);
+	if (drm->kms_in_fence_fd != -1) {
+		add_property(req, &drm->crtc_props, crtc_id,
+			     "OUT_FENCE_PTR", VOID2U64(&drm->kms_out_fence_fd));
+		add_property(req, &drm->plane_props, plane_id,
+			     "IN_FENCE_FD", drm->kms_in_fence_fd);
 	}
 
-	ret = drmModeAtomicCommit(drm.fd, req, flags, NULL);
+	ret = drmModeAtomicCommit(drm->fd, req, flags, NULL);
 	if (ret)
 		goto out;
 
-	if (drm.kms_in_fence_fd != -1) {
-		close(drm.kms_in_fence_fd);
-		drm.kms_in_fence_fd = -1;
+	if (drm->kms_in_fence_fd != -1) {
+		close(drm->kms_in_fence_fd);
+		drm->kms_in_fence_fd = -1;
 	}
 
 out:
@@ -564,14 +511,14 @@ static EGLSyncKHR create_fence(const struct egl *egl, int fd)
  * Seems like there is some room for a drmModeObjectGetNamedProperty()
  * type helper in libdrm..
  */
-static int get_plane_id(void)
+static int get_plane_id(struct drm *drm)
 {
 	drmModePlaneResPtr plane_resources;
 	uint32_t i, j;
 	int ret = -EINVAL;
 	int found_primary = 0;
 
-	plane_resources = drmModeGetPlaneResources(drm.fd);
+	plane_resources = drmModeGetPlaneResources(drm->fd);
 	if (!plane_resources) {
 		printf("drmModeGetPlaneResources failed: %s\n", strerror(errno));
 		return -1;
@@ -579,22 +526,22 @@ static int get_plane_id(void)
 
 	for (i = 0; (i < plane_resources->count_planes) && !found_primary; i++) {
 		uint32_t id = plane_resources->planes[i];
-		drmModePlanePtr plane = drmModeGetPlane(drm.fd, id);
+		drmModePlanePtr plane = drmModeGetPlane(drm->fd, id);
 		if (!plane) {
 			printf("drmModeGetPlane(%u) failed: %s\n", id, strerror(errno));
 			continue;
 		}
 
-		if (plane->possible_crtcs & (1 << drm.crtc_index)) {
+		if (plane->possible_crtcs & (1 << drm->crtc_index)) {
 			drmModeObjectPropertiesPtr props =
-				drmModeObjectGetProperties(drm.fd, id, DRM_MODE_OBJECT_PLANE);
+				drmModeObjectGetProperties(drm->fd, id, DRM_MODE_OBJECT_PLANE);
 
 			/* primary or not, this plane is good enough to use: */
 			ret = id;
 
 			for (j = 0; j < props->count_props; j++) {
 				drmModePropertyPtr p =
-					drmModeGetProperty(drm.fd, props->props[j]);
+					drmModeGetProperty(drm->fd, props->props[j]);
 
 				if ((strcmp(p->name, "type") == 0) &&
 						(props->prop_values[j] == DRM_PLANE_TYPE_PRIMARY)) {
@@ -617,13 +564,13 @@ static int get_plane_id(void)
 }
 
 static int
-get_properties(struct props *props,
+get_properties(struct drm *drm, struct props *props,
 	       const char *name, uint32_t type, uint32_t id)
 {
 	drmModeObjectProperties *drm_props;
 	uint32_t i;
 
-	drm_props = drmModeObjectGetProperties(drm.fd, id, type);
+	drm_props = drmModeObjectGetProperties(drm->fd, id, type);
 	if (!drm_props) {
 		printf("could not get %s %u properties: %s\n",
 		       name, id, strerror(errno));
@@ -633,7 +580,7 @@ get_properties(struct props *props,
 	props->count = drm_props->count_props;
 	props->info = calloc(props->count, sizeof(props->info));
 	for (i = 0; i < props->count; i++) {
-		props->info[i] = drmModeGetProperty(drm.fd,
+		props->info[i] = drmModeGetProperty(drm->fd,
 						    drm_props->props[i]);
 	}
 
@@ -642,41 +589,42 @@ get_properties(struct props *props,
 	return 0;
 }
 
-static struct drm *
-init_drm(const char *device)
+static int
+init_drm(struct drm *drm, const char *device)
 {
 	drmModeRes *resources;
 	drmModeEncoder *encoder = NULL;
 	int i, area, ret;
 	uint32_t plane_id, crtc_id;
 
-	drm.fd = open(device, O_RDWR);
-
-	if (drm.fd < 0) {
+	drm->kms_in_fence_fd = -1,
+	drm->kms_out_fence_fd = -1,
+	drm->fd = open(device, O_RDWR);
+	if (drm->fd < 0) {
 		printf("could not open drm device\n");
-		return NULL;
+		return -1;
 	}
 
-	ret = drmSetClientCap(drm.fd, DRM_CLIENT_CAP_ATOMIC, 1);
+	ret = drmSetClientCap(drm->fd, DRM_CLIENT_CAP_ATOMIC, 1);
 	if (ret) {
 		printf("no atomic modesetting support: %s\n", strerror(errno));
-		return NULL;
+		return -1;
 	}
 
-	resources = drmModeGetResources(drm.fd);
+	resources = drmModeGetResources(drm->fd);
 	if (!resources) {
 		printf("drmModeGetResources failed: %s\n", strerror(errno));
-		return NULL;
+		return -1;
 	}
 
 	/* find a connected connector: */
 	for (i = 0; i < resources->count_connectors; i++) {
-		drm.connector = drmModeGetConnector(drm.fd, resources->connectors[i]);
-		if (drm.connector->connection == DRM_MODE_CONNECTED) {
+		drm->connector = drmModeGetConnector(drm->fd, resources->connectors[i]);
+		if (drm->connector->connection == DRM_MODE_CONNECTED) {
 			/* it's connected, let's use this! */
 			break;
 		}
-		drmModeFreeConnector(drm.connector);
+		drmModeFreeConnector(drm->connector);
 	}
 
 	if (i == resources->count_connectors) {
@@ -684,33 +632,33 @@ init_drm(const char *device)
 		 * a connector..
 		 */
 		printf("no connected connector!\n");
-		return NULL;
+		return -1;
 	}
 
 	/* find preferred mode or the highest resolution mode: */
-	for (i = 0, area = 0; i < drm.connector->count_modes; i++) {
-		drmModeModeInfo *current_mode = &drm.connector->modes[i];
+	for (i = 0, area = 0; i < drm->connector->count_modes; i++) {
+		drmModeModeInfo *current_mode = &drm->connector->modes[i];
 
 		if (current_mode->type & DRM_MODE_TYPE_PREFERRED) {
-			drm.mode = current_mode;
+			drm->mode = current_mode;
 		}
 
 		int current_area = current_mode->hdisplay * current_mode->vdisplay;
 		if (current_area > area) {
-			drm.mode = current_mode;
+			drm->mode = current_mode;
 			area = current_area;
 		}
 	}
 
-	if (!drm.mode) {
+	if (!drm->mode) {
 		printf("could not find mode!\n");
-		return NULL;
+		return -1;
 	}
 
 	/* find encoder: */
 	for (i = 0; i < resources->count_encoders; i++) {
-		encoder = drmModeGetEncoder(drm.fd, resources->encoders[i]);
-		if (encoder->encoder_id == drm.connector->encoder_id)
+		encoder = drmModeGetEncoder(drm->fd, resources->encoders[i]);
+		if (encoder->encoder_id == drm->connector->encoder_id)
 			break;
 		drmModeFreeEncoder(encoder);
 		encoder = NULL;
@@ -719,42 +667,42 @@ init_drm(const char *device)
 	if (encoder) {
 		crtc_id = encoder->crtc_id;
 	} else {
-		crtc_id = find_crtc_for_connector(&drm, resources, drm.connector);
+		crtc_id = find_crtc_for_connector(drm, resources, drm->connector);
 		if (crtc_id == 0) {
 			printf("no crtc found!\n");
-			return NULL;
+			return -1;
 		}
 	}
 
 	for (i = 0; i < resources->count_crtcs; i++) {
 		if (resources->crtcs[i] == crtc_id) {
-			drm.crtc_index = i;
+			drm->crtc_index = i;
 			break;
 		}
 	}
 
-	drm.crtc = drmModeGetCrtc(drm.fd, crtc_id);
+	drm->crtc = drmModeGetCrtc(drm->fd, crtc_id);
 
 	drmModeFreeResources(resources);
 
-	ret = get_plane_id();
+	ret = get_plane_id(drm);
 	if (!ret) {
 		printf("could not find a suitable plane\n");
-		return NULL;
+		return -1;
 	} else {
 		plane_id = ret;
 	}
 
-	drm.plane = drmModeGetPlane(drm.fd, plane_id);
+	drm->plane = drmModeGetPlane(drm->fd, plane_id);
 
-	get_properties(&drm.plane_props, "plane",
+	get_properties(drm, &drm->plane_props, "plane",
 		       DRM_MODE_OBJECT_PLANE, plane_id);
-	get_properties(&drm.crtc_props, "crtc",
-		       DRM_MODE_OBJECT_CRTC, drm.crtc->crtc_id);
-	get_properties(&drm.connector_props, "connector",
-		       DRM_MODE_OBJECT_CONNECTOR, drm.connector->connector_id);
+	get_properties(drm, &drm->crtc_props, "crtc",
+		       DRM_MODE_OBJECT_CRTC, drm->crtc->crtc_id);
+	get_properties(drm, &drm->connector_props, "connector",
+		       DRM_MODE_OBJECT_CONNECTOR, drm->connector->connector_id);
 
-	return &drm;
+	return 0;
 }
 
 static bool has_ext(const char *extension_list, const char *ext)
@@ -1048,11 +996,16 @@ init_gl(struct gpu_scroller *scroller)
 
 	int drm_fd = gbm_device_get_fd(scroller->dev);
 	for (uint32_t i = 0; i < ARRAY_SIZE(scroller->tiles); i++) {
-		scroller->tiles[i] = create_tile(&scroller->egl, drm_fd, tile_width, tile_height);
+		scroller->tiles[i] = create_tile(drm_fd, tile_width, tile_height);
 		if (scroller->tiles[i] == NULL) {
 			printf("failed to initialize EGLImage texture\n");
 			return -1;
 		}
+
+		if (create_texture_for_tile(drm_fd, &scroller->egl,
+					    scroller->tiles[i],
+					    tile_width, tile_height) < 0)
+			return -1;
 	}
 
 	glGenBuffers(1, &scroller->vbo);
@@ -1062,41 +1015,6 @@ init_gl(struct gpu_scroller *scroller)
 	glEnableVertexAttribArray(0);
 
 	return 0;
-}
-
-static struct gpu_scroller *
-create_gpu_scroller(const char *device)
-{
-	struct gpu_scroller *scroller = malloc(sizeof(*scroller));
-	struct drm *drm;
-
-	drm = init_drm(device);
-	if (!drm) {
-		printf("failed to initialize atomic DRM\n");
-		return NULL;
-	}
-
-	scroller->dev = gbm_create_device(drm->fd);
-	scroller->width = drm->mode->hdisplay - 200;
-	scroller->height = drm->mode->vdisplay - 200;
-
-	static const uint64_t modifiers[] = { I915_FORMAT_MOD_Y_TILED };
-	scroller->surface = gbm_surface_create_with_modifiers(scroller->dev,
-							      scroller->width,
-							      scroller->height,
-							      GBM_FORMAT_XRGB8888,
-							      modifiers, ARRAY_SIZE(modifiers));
-	if (!scroller->surface) {
-		printf("failed to create gbm surface\n");
-		return NULL;
-	}
-
-	if (init_gl(scroller) < 0) {
-		printf("failed to initialize gl\n");
-		return NULL;
-	}
-
-	return scroller;
 }
 
 static void draw_cube_tex(struct gpu_scroller *scroller,
@@ -1120,7 +1038,7 @@ static void draw_cube_tex(struct gpu_scroller *scroller,
 	uint32_t tile_row = tile_y;
 
 	for (float fy = start_fy; fy > -1.0f; fy -= fh) {
-		uint32_t tile_index = tile_row * 29 + tile_x;
+		uint32_t tile_index = tile_row * tile_row_stride + tile_x;
 		tile_row++;
 
 		for (float fx = start_fx; fx < 1.0f; fx += fw) {
@@ -1143,8 +1061,9 @@ static void draw_cube_tex(struct gpu_scroller *scroller,
 }
 
 static int
-gpu_scroller_draw(struct gpu_scroller *scroller, uint32_t offset_x, uint32_t offset_y)
+gpu_scroller_draw(struct scroller *base_scroller, uint32_t offset_x, uint32_t offset_y)
 {
+	struct gpu_scroller *scroller = container_of(base_scroller, struct gpu_scroller, base);
 	struct drm_fb *fb;
 	struct egl *egl = &scroller->egl;
 	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
@@ -1157,12 +1076,12 @@ gpu_scroller_draw(struct gpu_scroller *scroller, uint32_t offset_x, uint32_t off
 	EGLSyncKHR gpu_fence = NULL;   /* out-fence from gpu, in-fence to kms */
 	EGLSyncKHR kms_fence = NULL;   /* in-fence to gpu, out-fence from kms */
 
-	if (drm.kms_out_fence_fd != -1) {
-		kms_fence = create_fence(egl, drm.kms_out_fence_fd);
+	if (scroller->drm.kms_out_fence_fd != -1) {
+		kms_fence = create_fence(egl, scroller->drm.kms_out_fence_fd);
 		assert(kms_fence);
 
 		/* driver now has ownership of the fence fd: */
-		drm.kms_out_fence_fd = -1;
+		scroller->drm.kms_out_fence_fd = -1;
 
 		/* wait "on the gpu" (ie. this won't necessarily block, but
 		 * will block the rendering until fence is signaled), until
@@ -1185,9 +1104,9 @@ gpu_scroller_draw(struct gpu_scroller *scroller, uint32_t offset_x, uint32_t off
 	/* after swapbuffers, gpu_fence should be flushed, so safe
 	 * to get fd:
 	 */
-	drm.kms_in_fence_fd = egl->eglDupNativeFenceFDANDROID(egl->display, gpu_fence);
+	scroller->drm.kms_in_fence_fd = egl->eglDupNativeFenceFDANDROID(egl->display, gpu_fence);
 	egl->eglDestroySyncKHR(egl->display, gpu_fence);
-	assert(drm.kms_in_fence_fd != -1);
+	assert(scroller->drm.kms_in_fence_fd != -1);
 
 	next_bo = gbm_surface_lock_front_buffer(scroller->surface);
 	if (!next_bo) {
@@ -1222,7 +1141,8 @@ gpu_scroller_draw(struct gpu_scroller *scroller, uint32_t offset_x, uint32_t off
 	 * Here you could also update drm plane layers if you want
 	 * hw composition
 	 */
-	ret = drm_atomic_commit(fb, flags);
+	ret = drm_atomic_commit(&scroller->drm, fb->fb_id,
+				0, 0, scroller->width, scroller->height, flags);
 	if (ret) {
 		printf("failed to commit: %s\n", strerror(errno));
 		return -1;
@@ -1236,19 +1156,191 @@ gpu_scroller_draw(struct gpu_scroller *scroller, uint32_t offset_x, uint32_t off
 	return 0;
 }
 
-static const char *shortopts = "D:";
+static struct scroller *
+create_gpu_scroller(const char *device)
+{
+	struct gpu_scroller *scroller = malloc(sizeof(*scroller));
+
+	scroller->last_bo = NULL;
+	if (init_drm(&scroller->drm, device) < 0) {
+		printf("failed to initialize atomic DRM\n");
+		return NULL;
+	}
+
+	scroller->dev = gbm_create_device(scroller->drm.fd);
+	scroller->width = scroller->drm.mode->hdisplay - 200;
+	scroller->height = scroller->drm.mode->vdisplay - 200;
+
+	static const uint64_t modifiers[] = { I915_FORMAT_MOD_Y_TILED };
+	scroller->surface = gbm_surface_create_with_modifiers(scroller->dev,
+							      scroller->width,
+							      scroller->height,
+							      GBM_FORMAT_ABGR8888,
+							      modifiers, ARRAY_SIZE(modifiers));
+	if (!scroller->surface) {
+		printf("failed to create gbm surface\n");
+		return NULL;
+	}
+
+	if (init_gl(scroller) < 0) {
+		printf("failed to initialize gl\n");
+		return NULL;
+	}
+
+	scroller->base.draw = gpu_scroller_draw;
+
+	return &scroller->base;
+}
+
+struct plane_scroller {
+	struct scroller base;
+
+	struct drm drm;
+	int width, height;
+
+	struct scratch_bo *scratch_bo;
+	struct tile *tiles[64];
+};
+
+static struct scratch_bo *
+create_scratch_bo(struct plane_scroller *scroller)
+{
+	struct scratch_bo *sbo = malloc(sizeof(*sbo));
+	int fd = scroller->drm.fd;
+
+	uint32_t scratch_width = 4096;
+	uint32_t scratch_height = 4096;
+	sbo->stride = scratch_width * 4;
+	uint32_t scratch_size = sbo->stride * scratch_height;
+	struct drm_i915_gem_create_v2 scratch_create = {
+		.size = scratch_size,
+		.flags = I915_GEM_CREATE_SCRATCH
+	};
+
+	int ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &scratch_create);
+	if (ret < 0) {
+		fprintf(stderr, "scratch gem create v2 failed: %s\n", strerror(errno));
+		return NULL;
+	}
+
+	sbo->gem_handle = scratch_create.handle;
+
+	uint32_t tile_stride = scroller->tiles[0]->stride;
+	for (uint32_t y = 0; y < scratch_height / tile_height; y++) {
+		for (uint32_t x = 0; x < sbo->stride / tile_stride; x++) {
+			uint32_t tile = (y * tile_row_stride + x) % ARRAY_SIZE(scroller->tiles);
+			/* All offsets, stride, width and height are in pages */
+			struct drm_i915_gem_set_pages set_pages = {
+				.dst_handle = scratch_create.handle,
+				.src_handle = scroller->tiles[tile]->gem_handle,
+
+				.dst_offset = x * tile_stride / 128 + y * sbo->stride / 128 * tile_height / 32,
+				.src_offset = 0,
+
+				/* A Y tile is 128 bytes wide, so divide the stride by
+				 * 128 to find the number of tiles (ie pages). */
+				.dst_stride = sbo->stride / 128,
+				.src_stride = tile_stride / 128,
+
+				/* Again, divide stride by 128 to get the width of the
+				 * region in tiles. Y tiles are 32 lines high, so
+				 * divide height by 32 to get height in number of
+				 * pages. */
+				.width = tile_stride / 128,
+				.height = tile_height / 32,
+			};
+
+			ret = safe_ioctl(fd, DRM_IOCTL_I915_GEM_SET_PAGES, &set_pages);
+			if (ret < 0) {
+				fprintf(stderr, "tile gem create v2 failed: %s\n", strerror(errno));
+				return NULL;
+			}
+		}
+	}
+
+	uint32_t handles[4] = { sbo->gem_handle, };
+	uint32_t strides[4] = { sbo->stride, };
+	uint32_t offsets[4] = { 0, };
+	uint64_t modifiers[4] = { I915_FORMAT_MOD_Y_TILED, };
+
+	ret = drmModeAddFB2WithModifiers(fd, scratch_width, scratch_height,
+					 DRM_FORMAT_XRGB8888, handles, strides, offsets,
+					 modifiers, &sbo->fb_id, DRM_MODE_FB_MODIFIERS);
+
+	if (ret) {
+		printf("failed to create fb: %s\n", strerror(errno));
+		free(sbo);
+		return NULL;
+	}
+
+	return sbo;
+}
+
+static int
+plane_scroller_draw(struct scroller *base_scroller, uint32_t offset_x, uint32_t offset_y)
+{
+	struct plane_scroller *scroller = container_of(base_scroller, struct plane_scroller, base);
+	uint32_t flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
+
+	int ret;
+
+	ret = drm_atomic_commit(&scroller->drm, scroller->scratch_bo->fb_id,
+				offset_x, offset_y,
+				scroller->width, scroller->height, flags);
+	if (ret) {
+		printf("failed to commit: %s\n", strerror(errno));
+		return -1;
+	}
+
+	return 0;
+}
+
+static struct scroller *
+create_plane_scroller(const char *device)
+{
+	struct plane_scroller *scroller = malloc(sizeof(*scroller));
+
+	if (init_drm(&scroller->drm, device) < 0) {
+		printf("failed to initialize atomic DRM\n");
+		return NULL;
+	}
+
+	scroller->width = scroller->drm.mode->hdisplay - 200;
+	scroller->height = scroller->drm.mode->vdisplay - 200;
+
+	for (uint32_t i = 0; i < ARRAY_SIZE(scroller->tiles); i++) {
+		scroller->tiles[i] = create_tile(scroller->drm.fd,
+						 tile_width, tile_height);
+		if (scroller->tiles[i] == NULL) {
+			printf("failed to initialize EGLImage texture\n");
+			return NULL;
+		}
+	}
+
+	scroller->scratch_bo = create_scratch_bo(scroller);
+
+	scroller->base.draw = plane_scroller_draw;
+
+	return &scroller->base;
+}
+
+static const char *shortopts = "D:M:";
 
 static const struct option longopts[] = {
 	{"device", required_argument, 0, 'D'},
+	{"mode",   required_argument, 0, 'M'},
 	{0, 0, 0, 0}
 };
 
 static void usage(const char *name)
 {
-	printf("Usage: %s [-D]\n"
+	printf("Usage: %s [-DM]\n"
 	       "\n"
 	       "options:\n"
-	       "    -D, --device=DEVICE      use the given device\n",
+	       "    -D, --device=DEVICE      use the given device\n"
+	       "    -M, --mode=MODE          specify mode, one of:\n"
+	       "        gpu       -  gpu rendered scrolling (default)\n"
+	       "        plane     -  plane rendered scrolling\n",
 	       name);
 }
 
@@ -1325,12 +1417,24 @@ int main(int argc, char *argv[])
 {
 	const char *device = "/dev/dri/card0";
 	int opt;
-	struct gpu_scroller *scroller;
+	struct scroller *scroller;
+	enum { MODE_GPU, MODE_PLANE } mode = MODE_GPU;
 
 	while ((opt = getopt_long_only(argc, argv, shortopts, longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'D':
 			device = optarg;
+			break;
+		case 'M':
+			if (strcmp(optarg, "gpu") == 0) {
+				mode = MODE_GPU;
+			} else if (strcmp(optarg, "plane") == 0) {
+				mode = MODE_PLANE;
+			} else {
+				printf("invalid mode: %s\n", optarg);
+				usage(argv[0]);
+				return -1;
+			}
 			break;
 		default:
 			usage(argv[0]);
@@ -1338,9 +1442,17 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	scroller = create_gpu_scroller(device);
+	switch (mode) {
+	case MODE_GPU:
+		scroller = create_gpu_scroller(device);
+		break;
+	case MODE_PLANE:
+		scroller = create_plane_scroller(device);
+		break;
+	}
+
 	if (!scroller) {
-		printf("failed to initialize GBM\n");
+		printf("failed to initialize scroller\n");
 		return -1;
 	}
 
@@ -1355,7 +1467,7 @@ int main(int argc, char *argv[])
 		const uint32_t offset_y = sin((i & 255) / 256.0f * 2 * M_PI) * 150 + 200;
 		i++;
 
-		ret = gpu_scroller_draw(scroller, offset_x, offset_y);
+		ret = scroller->draw(scroller, offset_x, offset_y);
 	}
 
 	return 0;
